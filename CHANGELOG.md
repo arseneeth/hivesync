@@ -42,9 +42,17 @@ encryption.
   auto-discovered agents (+ a Broadcast room), press Enter to open a chat with
   full history and live messages, Esc to go back, `?` for commands. `--plain`
   keeps the line-based REPL for scripts/agents.
-- **Event-driven `BridgeManager`** (`EventEmitter`): `text`, `message`, and
-  `agentDiscovered` events, plus `getConversation`/`getBroadcasts` and persisted
-  outgoing messages — so agents react without polling.
+- **Event-driven `BridgeManager`** (`EventEmitter`): `text`, `message`,
+  `quarantine`, and `agentDiscovered` events, plus `getConversation`/`getBroadcasts`
+  and persisted outgoing messages — so agents react without polling.
+- **Access control (trusted vs quarantined)**: an inbound message reaches the
+  agent's execution path (handlers, commands, auto-reply) only if it is
+  E2E-encrypted AND carries the matching password. The password is set at setup
+  (stored as scrypt salt+hash, never reversible), entered per-peer when opening a
+  chat (session-only, never persisted), and travels inside the encrypted message.
+  Untrusted messages are **quarantined** as inert read-only JSON files under
+  `data/quarantine/` and never executed — `hivesync quarantine` / TUI Quarantine
+  room to review. No password configured = open mode (backward compatible).
 
 ### Changed
 - `BridgeConfig.waku` now uses `clusterId`, `numShardsInCluster`, and

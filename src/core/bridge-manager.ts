@@ -1,27 +1,43 @@
 import * as path from 'path';
 import * as fs from 'fs';
+import * as os from 'os';
 import { EventEmitter } from 'events';
 import { HiveSync } from './hivesync-bridge';
 import { Identity } from './identity';
 import { Transport } from './transport';
+import { verifyPassword } from './crypto';
 import { StorageManager } from '../storage/storage-manager';
+import { QuarantineStore } from '../storage/quarantine-store';
 import { RealTimeSyncManager } from '../sync/real-time-sync';
-import { BridgeConfig, AgentIdentity, Message, MessageType } from '../types';
+import { BridgeConfig, AgentIdentity, Message, MessageType, QuarantinedMessage } from '../types';
 import { logger } from '../utils/logger';
 
+// Meta fields carried inside the (encrypted) message content, stripped before
+// the message is stored or handed to consumers.
+const AUTH_FIELD = '__auth';
+const AUTO_FIELD = '__auto';
+
 /**
- * Orchestrates identity, transport, storage and (optional) sync. Emits events so
- * both humans (the TUI) and agents (programmatic consumers) can react live
- * instead of polling:
- *  - `text`            (message: Message)        an incoming text message
- *  - `message`         (message: Message)        any incoming message
+ * Orchestrates identity, transport, storage and (optional) sync, and enforces
+ * access control. Emits events so both humans (the TUI) and agents react live:
+ *  - `text`            (message: Message)        a TRUSTED incoming text message
+ *  - `message`         (message: Message)        any TRUSTED incoming message
+ *  - `quarantine`      (message: QuarantinedMessage) an untrusted message held aside
  *  - `agentDiscovered` (agent: AgentIdentity)    a newly discovered peer
+ *
+ * Trust: if a password is configured (`config.auth`), an inbound message is
+ * trusted only when it is E2E-encrypted AND carries the matching password.
+ * Untrusted messages are quarantined (isolated files) and never executed. With
+ * no password configured the agent runs in open mode (all messages trusted).
  */
 export class BridgeManager extends EventEmitter {
   private readonly config: BridgeConfig;
   private readonly identity: Identity;
   private readonly hivesync: HiveSync;
   private readonly storage: StorageManager;
+  private readonly quarantine: QuarantineStore;
+  // Outbound passwords for peers, entered this session and never persisted.
+  private readonly sessionPasswords = new Map<string, string>();
   private realTimeSync: RealTimeSyncManager | null = null;
   private isRunning = false;
 
@@ -39,6 +55,17 @@ export class BridgeManager extends EventEmitter {
         : Identity.loadOrCreate(identityDir, config.agentId, config.agentName);
     this.hivesync = new HiveSync(config, this.identity, transport);
     this.storage = new StorageManager(config.storagePath);
+
+    const quarantineDir =
+      config.storagePath === ':memory:'
+        ? path.join(os.tmpdir(), `hivesync-quarantine-${sanitize(config.agentId)}-${process.pid}`)
+        : path.join(path.dirname(config.storagePath), 'quarantine');
+    this.quarantine = new QuarantineStore(quarantineDir);
+  }
+
+  /** True if access control is active (a password has been configured). */
+  get authEnabled(): boolean {
+    return !!this.config.auth?.hash;
   }
 
   async start(peerWaitTimeoutMs = 30000): Promise<boolean> {
@@ -112,20 +139,71 @@ export class BridgeManager extends EventEmitter {
 
   private setupMessageHandlers(): void {
     this.hivesync.onMessage(MessageType.TEXT, async (message) => {
-      await this.storage.saveMessage(message);
-      this.emit('text', message);
-      this.emit('message', message);
+      const { trusted, content, isAuto } = this.classify(message);
+      const msg: Message = { ...message, content };
+      if (!trusted) {
+        await this.quarantineMessage(msg);
+        return;
+      }
+      await this.storage.saveMessage(msg);
+      this.emit('text', msg);
+      this.emit('message', msg);
+      // Automated reply for trusted messages (not for auto-replies — anti-loop).
+      if (this.config.auth?.autoReply && !isAuto) {
+        await this.sendText(msg.sender, this.config.auth.autoReply, { auto: true }).catch(() => undefined);
+      }
     });
 
     this.hivesync.onMessage(MessageType.COMMAND, async (message) => {
-      await this.storage.saveMessage(message);
-      this.emit('message', message);
-      await this.handleCommand(message);
+      const { trusted, content } = this.classify(message);
+      const msg: Message = { ...message, content };
+      if (!trusted) {
+        await this.quarantineMessage(msg);
+        return;
+      }
+      await this.storage.saveMessage(msg);
+      this.emit('message', msg);
+      await this.handleCommand(msg);
     });
 
     this.hivesync.onMessage(MessageType.ACK, async (message) => {
       logger.debug(`ACK from ${message.sender} for ${message.content?.originalMessageId}`);
     });
+  }
+
+  /**
+   * Decide whether an inbound message is trusted, and strip the meta fields
+   * (password / auto-reply marker) from its content.
+   */
+  private classify(message: Message): { trusted: boolean; content: any; isAuto: boolean } {
+    const content = { ...(message.content ?? {}) };
+    const auth = typeof content[AUTH_FIELD] === 'string' ? (content[AUTH_FIELD] as string) : undefined;
+    const isAuto = content[AUTO_FIELD] === true;
+    delete content[AUTH_FIELD];
+    delete content[AUTO_FIELD];
+
+    let trusted: boolean;
+    if (!this.config.auth?.hash) {
+      trusted = true; // open mode
+    } else {
+      // Trust requires an encrypted message carrying the matching password.
+      trusted =
+        message.encrypted === true &&
+        !!auth &&
+        verifyPassword(auth, { salt: this.config.auth.salt, hash: this.config.auth.hash });
+    }
+    return { trusted, content, isAuto };
+  }
+
+  private async quarantineMessage(message: Message): Promise<void> {
+    const reason = this.config.auth?.hash
+      ? message.encrypted
+        ? 'missing or invalid password'
+        : 'unauthenticated (not encrypted)'
+      : 'quarantined';
+    const file = await this.quarantine.add(message, reason);
+    logger.warn(`Quarantined message from ${message.sender} (${reason}) -> ${file}`);
+    this.emit('quarantine', { ...message, reason, file } as unknown as QuarantinedMessage);
   }
 
   private async handleCommand(message: Message): Promise<void> {
@@ -163,15 +241,36 @@ export class BridgeManager extends EventEmitter {
   }
 
   async sendTextMessage(recipient: string, text: string): Promise<string> {
-    const encrypted = recipient !== 'broadcast' && this.isAgentKnown(recipient);
+    return this.sendText(recipient, text, {});
+  }
+
+  /**
+   * Internal text send. Attaches the session password as `__auth` ONLY when the
+   * message will actually be encrypted to the recipient (so a password is never
+   * sent in the clear). `auto` tags an automated reply so it can't re-trigger
+   * another automated reply.
+   */
+  private async sendText(
+    recipient: string,
+    text: string,
+    opts: { auto?: boolean }
+  ): Promise<string> {
+    const willEncrypt = recipient !== 'broadcast' && this.isAgentKnown(recipient);
+    const wire: any = { text };
+    if (opts.auto) wire[AUTO_FIELD] = true;
+    if (willEncrypt) {
+      const pw = this.sessionPasswords.get(recipient);
+      if (pw) wire[AUTH_FIELD] = pw;
+    }
+
     const id = await this.hivesync.sendMessage({
       sender: this.config.agentId,
       recipient,
       type: MessageType.TEXT,
-      content: { text },
+      content: wire,
       encrypted: recipient !== 'broadcast',
     });
-    // Record our own outgoing message so conversation history is complete.
+    // Record our own outgoing message (clean content) so history is complete.
     await this.storage.saveMessage({
       id,
       sender: this.config.agentId,
@@ -179,13 +278,43 @@ export class BridgeManager extends EventEmitter {
       type: MessageType.TEXT,
       content: { text },
       timestamp: new Date(),
-      encrypted,
+      encrypted: willEncrypt,
     });
     return id;
   }
 
   private isAgentKnown(agentId: string): boolean {
     return this.hivesync.getKnownAgents().some((a) => a.id === agentId && !!a.encPublicKey);
+  }
+
+  // --- access control (outbound) ------------------------------------------
+
+  /** Store a peer's password for this session only (never persisted). */
+  setAgentPassword(agentId: string, password: string): void {
+    if (password) this.sessionPasswords.set(agentId, password);
+    else this.sessionPasswords.delete(agentId);
+  }
+
+  clearAgentPassword(agentId: string): void {
+    this.sessionPasswords.delete(agentId);
+  }
+
+  hasAgentPassword(agentId: string): boolean {
+    return this.sessionPasswords.has(agentId);
+  }
+
+  // --- quarantine (inbound) -----------------------------------------------
+
+  getQuarantineDir(): string {
+    return this.quarantine.getDir();
+  }
+
+  async getQuarantine(limit = 500): Promise<QuarantinedMessage[]> {
+    return this.quarantine.list(limit);
+  }
+
+  async getQuarantineCount(): Promise<number> {
+    return this.quarantine.count();
   }
 
   async sendCommand(recipient: string, command: string, args: any = {}): Promise<string> {
@@ -263,6 +392,8 @@ export class BridgeManager extends EventEmitter {
       agentId: this.config.agentId,
       agentName: this.config.agentName,
       keyId: this.identity.keyId,
+      authEnabled: this.authEnabled,
+      quarantined: await this.getQuarantineCount(),
       hivesync,
       realTimeSync: !!this.realTimeSync,
       fileWatching: this.realTimeSync?.isWatching() || false,
@@ -281,4 +412,8 @@ export class BridgeManager extends EventEmitter {
     }
     return [];
   }
+}
+
+function sanitize(s: string): string {
+  return String(s).replace(/[^a-zA-Z0-9_.-]/g, '_').slice(0, 40) || 'agent';
 }

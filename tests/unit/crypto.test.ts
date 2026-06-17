@@ -6,6 +6,8 @@ import {
   encrypt,
   decrypt,
   fingerprint,
+  hashPassword,
+  verifyPassword,
 } from '../../src/core/crypto';
 
 describe('crypto', () => {
@@ -72,6 +74,33 @@ describe('crypto', () => {
       const kp = generateSigningKeyPair();
       expect(fingerprint(kp.publicKey)).toBe(fingerprint(kp.publicKey));
       expect(fingerprint(kp.publicKey)).not.toBe(fingerprint(generateSigningKeyPair().publicKey));
+    });
+  });
+
+  describe('password hashing (scrypt)', () => {
+    test('verifies the correct password', () => {
+      const stored = hashPassword('correct horse battery staple');
+      expect(verifyPassword('correct horse battery staple', stored)).toBe(true);
+    });
+
+    test('rejects the wrong password', () => {
+      const stored = hashPassword('s3cret');
+      expect(verifyPassword('guess', stored)).toBe(false);
+      expect(verifyPassword('', stored)).toBe(false);
+    });
+
+    test('uses a random salt (same password hashes differently)', () => {
+      const a = hashPassword('same');
+      const b = hashPassword('same');
+      expect(a.salt).not.toBe(b.salt);
+      expect(a.hash).not.toBe(b.hash);
+      expect(verifyPassword('same', a)).toBe(true);
+      expect(verifyPassword('same', b)).toBe(true);
+    });
+
+    test('does not store the password in cleartext', () => {
+      const stored = hashPassword('plaintextpw');
+      expect(JSON.stringify(stored)).not.toContain('plaintextpw');
     });
   });
 });

@@ -111,6 +111,22 @@ export interface ObsidianConfig {
   enabled: boolean;
 }
 
+/**
+ * Access control. A peer must include this password (inside the E2E-encrypted
+ * message) for its message to be *trusted* — i.e. processed/executed and
+ * auto-replied. Only the scrypt salt+hash are stored; the password is never
+ * persisted. If `auth` is absent the agent runs in open mode (all messages
+ * trusted) for backward compatibility.
+ */
+export interface AuthConfig {
+  /** scrypt salt (base64). */
+  salt: string;
+  /** scrypt hash of the password (base64). */
+  hash: string;
+  /** Optional automated reply sent when a trusted message arrives. */
+  autoReply?: string;
+}
+
 export interface BridgeConfig {
   agentId: string;
   agentName: string;
@@ -119,4 +135,19 @@ export interface BridgeConfig {
   /** Discovery announce interval in seconds (<= 0 disables periodic announce). */
   syncInterval: number;
   obsidian?: ObsidianConfig;
+  auth?: AuthConfig;
+}
+
+/** An untrusted message held in the quarantine folder (never executed). */
+export interface QuarantinedMessage {
+  id: string;
+  sender: string;
+  recipient: string;
+  type: MessageType;
+  content: any;
+  timestamp: string;
+  encrypted: boolean;
+  reason: string;
+  quarantinedAt: string;
+  file?: string;
 }

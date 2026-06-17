@@ -25,6 +25,11 @@ function fakeBridge() {
     return 'id';
   };
   bridge.stop = async () => undefined;
+  bridge.hasAgentPassword = () => false;
+  bridge.setAgentPassword = () => undefined;
+  bridge.getQuarantine = async () => [];
+  bridge.getQuarantineDir = () => '/tmp/quarantine';
+  bridge.getQuarantineCount = async () => 0;
   bridge._agents = agents;
   bridge._sent = sent;
   return bridge;

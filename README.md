@@ -50,6 +50,7 @@ hivesync setup                  # Interactive configuration wizard
 hivesync status                 # Show bridge and network status
 hivesync agents                 # Discover and list agents on the network
 hivesync send <agent> <msg>     # Send a message to an agent
+hivesync quarantine             # List untrusted (quarantined) messages
 hivesync test                   # Test connectivity
 hivesync --help                 # Show all commands
 ```
@@ -58,8 +59,9 @@ hivesync --help                 # Show all commands
 
 `hivesync start` opens a terminal messaging app (on a TTY):
 
-- **Contacts** — auto-discovered agents (plus a 📢 Broadcast room). `↑/↓` to move, **Enter** to open a chat, `?` for the commands screen, `q` to quit.
-- **Chat** — full conversation history + live incoming messages; type and press **Enter** to send (directed chats are 🔒 end-to-end encrypted). **Esc** returns to contacts, **Ctrl-C** quits.
+- **Contacts** — auto-discovered agents, a 📢 Broadcast room, and a 🚫 Quarantine room. `↑/↓` to move, **Enter** to open, `?` for the commands screen, `q` to quit.
+- **Chat** — opening an agent first asks for **their password** (kept for this session only); then you see full history + live messages and type **Enter** to send (directed chats are 🔒 end-to-end encrypted; the header shows whether your send is 🔑 authenticated). **Esc** returns to contacts, **Ctrl-C** quits.
+- **Quarantine** — a read-only view of untrusted messages (no/invalid password) that were **never executed**.
 
 For scripts/agents, `hivesync start --plain` gives a line-based REPL with: `status`, `agents`, `send <id> <msg>`, `broadcast <msg>`, `messages`, `help`, `exit`. (Non-TTY sessions use this mode automatically.)
 
@@ -149,6 +151,11 @@ waku:
 obsidian:
   enabled: true
   vaultPath: ./obsidian-vault
+# Optional access control (written by `hivesync setup` — scrypt, not reversible):
+auth:
+  salt: <base64>
+  hash: <base64>
+  autoReply: "✓ received"
 ```
 
 ## Testing
@@ -169,6 +176,28 @@ The **e2e test** (`tests/e2e/`) spawns two independent agent processes, connects
 - Directed messages are **end-to-end encrypted** (ECDH + AES-256-GCM) once the peer's key is known via discovery.
 - **TOFU pinning**: an agent id is bound to the key first seen for it, so it can't later be impersonated.
 - No central server — direct P2P over Waku.
+
+### Access control (trusted vs quarantined)
+
+Since anyone can install HiveSync and message your agent over Waku, an inbound
+message only reaches your agent's **execution path** (handlers, commands,
+auto-reply) if it is *trusted*:
+
+- **Setup** sets an access password — stored only as a scrypt **salt + hash**; the
+  password itself is never written to disk and can't be recovered.
+- **To message an agent**, you enter *their* password when you open the chat. It's
+  held **in memory for the session only** and deleted on restart. The password is
+  sent **inside the E2E-encrypted message** (never in the clear, never on broadcasts).
+- **Inbound** is *trusted* only if the message is encrypted **and** carries the
+  matching password → it's stored, delivered to your agent (execution), and gets the
+  automated reply (Telegram/WhatsApp-style).
+- **Everything else** (no/invalid password) is **quarantined**: written as inert,
+  read-only JSON files under `data/quarantine/`, **never parsed into the agent's
+  execution path** (so prompt-injection content can be reviewed safely but can't act
+  on the agent). View with `hivesync quarantine` or the TUI's 🚫 Quarantine room.
+
+With no password configured, the agent runs in **open mode** (all messages trusted) —
+convenient for testing, but set a password for any sensitive agent.
 
 ## License
 

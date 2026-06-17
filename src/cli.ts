@@ -243,6 +243,31 @@ program
   });
 
 program
+  .command('quarantine')
+  .description('List untrusted (quarantined) messages — never executed')
+  .action(async () => {
+    try {
+      const config = await loadConfig();
+      const bridge = new BridgeManager(config);
+      const items = await bridge.getQuarantine();
+      console.log(chalk.cyan(`\n=== Quarantine (${items.length}) ===`));
+      console.log(chalk.gray(`folder: ${bridge.getQuarantineDir()}\n`));
+      if (items.length === 0) {
+        console.log(chalk.green('No quarantined messages.'));
+      } else {
+        items.forEach((q, i) => {
+          const text = q.content && typeof q.content.text === 'string' ? q.content.text : JSON.stringify(q.content);
+          console.log(chalk.white(`${i + 1}. from ${q.sender}  ${new Date(q.timestamp).toLocaleString()}`));
+          console.log(chalk.red(`   reason: ${q.reason}`));
+          console.log(chalk.gray(`   ${text}\n`));
+        });
+      }
+    } catch (error) {
+      logger.error('Failed to read quarantine:', error);
+    }
+  });
+
+program
   .command('watch')
   .description('Start file watcher for real-time sync')
   .action(async () => {

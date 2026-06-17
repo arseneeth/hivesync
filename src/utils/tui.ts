@@ -4,6 +4,7 @@ import { Message, AgentIdentity } from '../types';
 import { logger } from './logger';
 
 const BROADCAST = 'broadcast';
+const QUARANTINE = 'quarantine';
 
 /**
  * A small terminal messaging app over HiveSync.
@@ -30,8 +31,9 @@ export async function startTui(
   });
 
   const unread = new Map<string, number>();
-  let view: 'contacts' | 'chat' | 'help' = 'contacts';
+  let view: 'contacts' | 'chat' | 'help' | 'password' | 'quarantine' = 'contacts';
   let openPeer: string | null = null;
+  let pendingPeer: string | null = null;
   // Maps a contacts-list row index to a peer id ('broadcast' or an agentId).
   let rowToPeer: string[] = [];
 
@@ -113,6 +115,48 @@ export async function startTui(
     content: helpText(),
   });
 
+  // --- Quarantine view (read-only) ----------------------------------------
+  const quarantineLog = blessed.log({
+    parent: screen,
+    top: 1,
+    bottom: 1,
+    left: 0,
+    width: '100%',
+    tags: true,
+    scrollable: true,
+    alwaysScroll: true,
+    mouse: true,
+    keys: true,
+    padding: { left: 1 },
+    hidden: true,
+  });
+
+  // --- Password prompt overlay --------------------------------------------
+  const pwPrompt = blessed.box({
+    parent: screen,
+    top: 'center',
+    left: 'center',
+    width: '70%',
+    height: 7,
+    border: { type: 'line' },
+    tags: true,
+    label: ' password ',
+    style: { border: { fg: 'yellow' } },
+    hidden: true,
+  });
+  const pwLabel = blessed.text({ parent: pwPrompt, top: 0, left: 1, right: 1, tags: true });
+  const pwInput = blessed.textbox({
+    parent: pwPrompt,
+    bottom: 1,
+    left: 1,
+    right: 1,
+    height: 1,
+    inputOnFocus: true,
+    censor: true,
+    keys: true,
+    style: { fg: 'white', bg: 'black' },
+  });
+
   // --- rendering helpers ---------------------------------------------------
   function setHeader(text: string): void {
     header.setContent(` {bold}HiveSync{/bold}  ${text}`);
@@ -138,10 +182,11 @@ export async function startTui(
       .slice()
       .sort((a, b) => a.name.localeCompare(b.name));
 
-    rowToPeer = [BROADCAST, ...agents.map((a) => a.id)];
+    rowToPeer = [BROADCAST, QUARANTINE, ...agents.map((a) => a.id)];
 
     const items = [
       `{yellow-fg}📢 Broadcast{/yellow-fg}${badge(BROADCAST)}`,
+      `{red-fg}🚫 Quarantine{/red-fg}${badge(QUARANTINE)}`,
       ...agents.map((a) => `{cyan-fg}${a.name}{/cyan-fg} {gray-fg}(${shortId(a.id)}){/gray-fg}${badge(a.id)}`),
     ];
     if (agents.length === 0) {
@@ -173,14 +218,58 @@ export async function startTui(
   function showContacts(): void {
     view = 'contacts';
     openPeer = null;
+    pendingPeer = null;
     chatLog.hide();
     input.hide();
     help.hide();
+    quarantineLog.hide();
+    pwPrompt.hide();
     contacts.show();
     setHeader('Contacts');
-    setFooter('{bold}↑/↓{/bold} move · {bold}Enter{/bold} open chat · {bold}?{/bold} commands · {bold}q{/bold} quit');
+    setFooter('{bold}↑/↓{/bold} move · {bold}Enter{/bold} open · {bold}?{/bold} commands · {bold}q{/bold} quit');
     contacts.focus();
     refreshContacts();
+  }
+
+  // Ask for the peer's password (session-only), then open the chat.
+  function openAgent(peer: string): void {
+    view = 'password';
+    pendingPeer = peer;
+    pwLabel.setContent(
+      `Password for {cyan-fg}${escapeTags(nameFor(peer))}{/cyan-fg}\n` +
+        '{gray-fg}Enter to confirm · blank = unauthenticated · Esc to cancel{/gray-fg}'
+    );
+    pwInput.clearValue();
+    pwPrompt.show();
+    pwInput.focus();
+    screen.render();
+  }
+
+  async function showQuarantine(): Promise<void> {
+    view = 'quarantine';
+    unread.set(QUARANTINE, 0);
+    contacts.hide();
+    quarantineLog.show();
+    quarantineLog.setContent('');
+    const items = await bridge.getQuarantine();
+    if (items.length === 0) {
+      quarantineLog.add('{gray-fg}No quarantined messages.{/gray-fg}');
+    } else {
+      quarantineLog.add('{red-fg}{bold}UNTRUSTED — these messages were NOT executed.{/bold}{/red-fg}');
+      quarantineLog.add('');
+      for (const q of items) {
+        const t = new Date(q.timestamp);
+        const time = `${pad(t.getHours())}:${pad(t.getMinutes())}`;
+        quarantineLog.add(
+          `{gray-fg}${time}{/gray-fg} {cyan-fg}${escapeTags(q.sender)}{/cyan-fg} {red-fg}[${escapeTags(q.reason)}]{/red-fg}`
+        );
+        quarantineLog.add(`  ${escapeTags(textOf(q.content))}`);
+      }
+    }
+    setHeader('Quarantine (read-only)');
+    setFooter(`{bold}Esc{/bold} back · files: ${bridge.getQuarantineDir()}`);
+    quarantineLog.focus();
+    screen.render();
   }
 
   async function showChat(peer: string): Promise<void> {
@@ -189,6 +278,8 @@ export async function startTui(
     unread.set(peer, 0);
     contacts.hide();
     help.hide();
+    quarantineLog.hide();
+    pwPrompt.hide();
     chatLog.show();
     input.show();
     chatLog.setContent('');
@@ -196,14 +287,21 @@ export async function startTui(
     const history = peer === BROADCAST ? await bridge.getBroadcasts() : await bridge.getConversation(peer);
     history.forEach(renderMessage);
 
-    const encNote =
-      peer === BROADCAST
-        ? '{yellow-fg}broadcast — signed, not encrypted{/yellow-fg}'
-        : bridge.getKnownAgents().some((a) => a.id === peer && a.encPublicKey)
-          ? '{green-fg}🔒 end-to-end encrypted{/green-fg}'
-          : '{red-fg}peer key unknown — messages sent in plaintext{/red-fg}';
-    setHeader(`Chat · ${escapeTags(nameFor(peer))} · ${encNote}`);
-    setFooter('{bold}Enter{/bold} send · {bold}Esc{/bold} back to contacts · {bold}Ctrl-C{/bold} quit');
+    let note: string;
+    if (peer === BROADCAST) {
+      note = '{yellow-fg}broadcast — signed, not encrypted{/yellow-fg}';
+    } else {
+      const known = bridge.getKnownAgents().some((a) => a.id === peer && a.encPublicKey);
+      const enc = known
+        ? '{green-fg}🔒 encrypted{/green-fg}'
+        : '{red-fg}peer key unknown — plaintext{/red-fg}';
+      const auth = bridge.hasAgentPassword(peer)
+        ? '{green-fg}🔑 authenticated{/green-fg}'
+        : '{yellow-fg}⚠ no password — will be quarantined for them{/yellow-fg}';
+      note = `${enc} · ${auth}`;
+    }
+    setHeader(`Chat · ${escapeTags(nameFor(peer))} · ${note}`);
+    setFooter('{bold}Enter{/bold} send · {bold}Esc{/bold} back · {bold}Ctrl-C{/bold} quit');
     input.focus();
     screen.render();
   }
@@ -213,6 +311,8 @@ export async function startTui(
     contacts.hide();
     chatLog.hide();
     input.hide();
+    quarantineLog.hide();
+    pwPrompt.hide();
     help.show();
     setHeader('Commands');
     setFooter('{bold}Esc{/bold} back to contacts · {bold}q{/bold} quit');
@@ -223,8 +323,27 @@ export async function startTui(
   // --- events --------------------------------------------------------------
   contacts.on('select', (_item, index) => {
     const peer = rowToPeer[index];
-    if (peer) void showChat(peer);
+    if (!peer) return;
+    if (peer === QUARANTINE) void showQuarantine();
+    else if (peer === BROADCAST) void showChat(BROADCAST);
+    else openAgent(peer); // ask for password first
   });
+
+  pwInput.on('submit', (value: string) => {
+    if (pendingPeer) {
+      bridge.setAgentPassword(pendingPeer, (value || '').trim());
+      const peer = pendingPeer;
+      pwInput.clearValue();
+      pwPrompt.hide();
+      void showChat(peer);
+    }
+  });
+  pwInput.key('escape', () => {
+    pwInput.clearValue();
+    pwPrompt.hide();
+    showContacts();
+  });
+  quarantineLog.key('escape', () => showContacts());
 
   input.on('submit', async (value: string) => {
     const text = (value || '').trim();
@@ -273,6 +392,13 @@ export async function startTui(
     }
   });
 
+  // Untrusted messages never enter a chat — only the Quarantine view.
+  bridge.on('quarantine', () => {
+    unread.set(QUARANTINE, (unread.get(QUARANTINE) || 0) + 1);
+    if (view === 'contacts') refreshContacts();
+    else if (view === 'quarantine') void showQuarantine();
+  });
+
   // Global quit.
   screen.key(['q', 'C-c'], async () => {
     screen.destroy();
@@ -303,6 +429,15 @@ function pad(n: number): string {
   return n.toString().padStart(2, '0');
 }
 
+function textOf(content: any): string {
+  if (content && typeof content.text === 'string') return content.text;
+  try {
+    return JSON.stringify(content);
+  } catch {
+    return String(content);
+  }
+}
+
 function helpText(): string {
   return [
     '{bold}HiveSync — commands & keys{/bold}',
@@ -319,6 +454,13 @@ function helpText(): string {
     '  mouse / wheel    scroll history',
     '  🔒               message was end-to-end encrypted',
     '  ✉️                message was sent in plaintext (broadcast or unknown key)',
+    '',
+    '{cyan-fg}Access control{/cyan-fg}',
+    '  Opening an agent asks for {bold}their password{/bold} (kept for this session',
+    '  only, never saved). With the right password your messages are trusted',
+    '  and trigger execution + an automated reply on their side.',
+    '  Messages to you {bold}without{/bold} a valid password are NOT executed — they',
+    '  go to {red-fg}🚫 Quarantine{/red-fg} (inert files) for safe review.',
     '',
     '{cyan-fg}Contacts{/cyan-fg}',
     '  Agents are auto-discovered over Waku and appear automatically.',
