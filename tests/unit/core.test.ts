@@ -1,276 +1,196 @@
 import { HiveSync } from '../../src/core/hivesync-bridge';
-import { BridgeConfig, MessageType } from '../../src/types';
+import { Identity } from '../../src/core/identity';
+import { InMemoryTransport } from '../../src/core/transport';
+import { BridgeConfig, MessageType, Message, AgentIdentity } from '../../src/types';
 
-jest.mock('@waku/sdk');
+const TOPIC = '/hivesync-test/1/core/proto';
 
-const mockConfig: BridgeConfig = {
-  agentId: 'test-agent-1',
-  agentName: 'Test Agent',
-  storagePath: ':memory:',
-  syncInterval: 0,
-  waku: {
-    listenAddresses: [],
-    bootstrapNodes: [],
-    pubsubTopic: '/test/topic',
-    keepAlive: false,
-    maxPeers: 1,
-  },
-};
-
-function createMockNode() {
+function makeConfig(agentId: string): BridgeConfig {
   return {
-    peerId: { toString: () => 'test-peer-id' },
-    filter: {
-      subscribe: jest.fn().mockResolvedValue({
-        subscription: { subscribe: jest.fn(), unsubscribe: jest.fn() },
-        error: null,
-        results: { successes: [], failures: [] },
-      }),
+    agentId,
+    agentName: agentId,
+    storagePath: ':memory:',
+    syncInterval: 0, // no periodic announce noise during tests
+    waku: {
+      listenAddresses: [],
+      bootstrapNodes: [],
+      clusterId: 1,
+      numShardsInCluster: 8,
+      contentTopic: TOPIC,
+      keepAlive: false,
+      maxPeers: 1,
     },
-    lightPush: {
-      send: jest.fn().mockResolvedValue({ successes: [], failures: [] }),
-    },
-    start: jest.fn().mockResolvedValue(undefined),
-    stop: jest.fn().mockResolvedValue(undefined),
-    waitForPeers: jest.fn().mockResolvedValue(undefined),
-    isStarted: jest.fn().mockReturnValue(true),
-    isConnected: jest.fn().mockReturnValue(true),
-    getConnectedPeers: jest.fn().mockResolvedValue([]),
   };
 }
 
-describe('HiveSync Core', () => {
-  let hivesync: HiveSync;
+function makeNode(agentId: string): { node: HiveSync; transport: InMemoryTransport } {
+  const transport = new InMemoryTransport(TOPIC, agentId);
+  const node = new HiveSync(makeConfig(agentId), Identity.ephemeral(agentId, agentId), transport);
+  return { node, transport };
+}
 
-  beforeEach(() => {
-    hivesync = new HiveSync(mockConfig);
+const tick = () => new Promise((r) => setTimeout(r, 30));
+async function waitFor(pred: () => boolean, ms = 1000): Promise<boolean> {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    if (pred()) return true;
+    await tick();
+  }
+  return pred();
+}
+
+describe('HiveSync core', () => {
+  let alice: HiveSync;
+  let bob: HiveSync;
+
+  beforeEach(async () => {
+    alice = makeNode('alice').node;
+    bob = makeNode('bob').node;
+    await alice.initialize(0);
+    await bob.initialize(0);
   });
 
   afterEach(async () => {
-    await hivesync.disconnect();
+    await alice.disconnect();
+    await bob.disconnect();
   });
 
-  describe('Initialization', () => {
-    test('should create instance with config', () => {
-      expect(hivesync).toBeInstanceOf(HiveSync);
-      expect(hivesync.getStatus().connected).toBe(false);
-    });
+  test('agents discover each other via ANNOUNCE', async () => {
+    expect(await waitFor(() => bob.getKnownAgents().some((a) => a.id === 'alice'))).toBe(true);
+    expect(await waitFor(() => alice.getKnownAgents().some((a) => a.id === 'bob'))).toBe(true);
 
-    test('should report connected status when node is set', () => {
-      const mockNode = createMockNode();
-      // @ts-ignore
-      hivesync['node'] = mockNode;
-      // @ts-ignore
-      hivesync['isConnected'] = true;
-
-      const status = hivesync.getStatus();
-      expect(status.connected).toBe(true);
-      expect(status.peerId).toBe('test-peer-id');
-    });
-
-    test('should initialize with mocked createLightNode', async () => {
-      const { createLightNode } = require('@waku/sdk');
-      const mockNode = createMockNode();
-      createLightNode.mockResolvedValue(mockNode);
-
-      const result = await hivesync.initialize();
-
-      expect(result).toBe(true);
-      expect(hivesync.getStatus().connected).toBe(true);
-      expect(mockNode.start).toHaveBeenCalled();
-      expect(mockNode.waitForPeers).toHaveBeenCalled();
-    });
+    const known = bob.getKnownAgents().find((a) => a.id === 'alice')!;
+    expect(known.publicKey).toBeDefined();
+    expect(known.encPublicKey).toBeDefined();
   });
 
-  describe('Message Handling', () => {
-    test('should register message handlers', () => {
-      const handler = jest.fn();
-      hivesync.onMessage(MessageType.TEXT, handler);
-      expect(typeof hivesync.onMessage).toBe('function');
+  test('directed text message reaches only the addressee', async () => {
+    await waitFor(() => alice.getKnownAgents().some((a) => a.id === 'bob'));
+
+    const received: Message[] = [];
+    bob.onMessage(MessageType.TEXT, (m) => received.push(m));
+
+    await alice.sendMessage({
+      sender: 'alice',
+      recipient: 'bob',
+      type: MessageType.TEXT,
+      content: { text: 'hi bob' },
+      encrypted: false,
     });
 
-    test('should dispatch incoming messages to registered handlers', async () => {
-      const handler = jest.fn();
-      hivesync.onMessage(MessageType.TEXT, handler);
-
-      const mockNode = createMockNode();
-      // @ts-ignore
-      hivesync['node'] = mockNode;
-      // @ts-ignore
-      hivesync['isConnected'] = true;
-
-      const testMessage = {
-        id: 'test-id',
-        sender: 'sender-1',
-        recipient: 'test-agent-1',
-        type: MessageType.TEXT,
-        content: { text: 'Hello' },
-        timestamp: new Date().toISOString(),
-        encrypted: false,
-      };
-
-      // @ts-ignore
-      await hivesync['handleIncomingMessage']({
-        payload: new TextEncoder().encode(JSON.stringify(testMessage)),
-      });
-
-      expect(handler).toHaveBeenCalledWith(
-        expect.objectContaining({
-          id: 'test-id',
-          sender: 'sender-1',
-          type: MessageType.TEXT,
-        })
-      );
-    });
-
-    test('should ignore messages for other agents', async () => {
-      const handler = jest.fn();
-      hivesync.onMessage(MessageType.TEXT, handler);
-
-      const mockNode = createMockNode();
-      // @ts-ignore
-      hivesync['node'] = mockNode;
-      // @ts-ignore
-      hivesync['isConnected'] = true;
-
-      const testMessage = {
-        id: 'test-id',
-        sender: 'sender-1',
-        recipient: 'other-agent',
-        type: MessageType.TEXT,
-        content: { text: 'Hello' },
-        timestamp: new Date().toISOString(),
-        encrypted: false,
-      };
-
-      // @ts-ignore
-      await hivesync['handleIncomingMessage']({
-        payload: new TextEncoder().encode(JSON.stringify(testMessage)),
-      });
-
-      expect(handler).not.toHaveBeenCalled();
-    });
-
-    test('should accept broadcast messages', async () => {
-      const handler = jest.fn();
-      hivesync.onMessage(MessageType.TEXT, handler);
-
-      const mockNode = createMockNode();
-      // @ts-ignore
-      hivesync['node'] = mockNode;
-      // @ts-ignore
-      hivesync['isConnected'] = true;
-
-      const testMessage = {
-        id: 'test-id',
-        sender: 'sender-1',
-        recipient: 'broadcast',
-        type: MessageType.TEXT,
-        content: { text: 'Hello everyone' },
-        timestamp: new Date().toISOString(),
-        encrypted: false,
-      };
-
-      // @ts-ignore
-      await hivesync['handleIncomingMessage']({
-        payload: new TextEncoder().encode(JSON.stringify(testMessage)),
-      });
-
-      expect(handler).toHaveBeenCalled();
-    });
-
-    test('should send message via lightPush.send', async () => {
-      const mockNode = createMockNode();
-      // @ts-ignore
-      hivesync['node'] = mockNode;
-      // @ts-ignore
-      hivesync['isConnected'] = true;
-
-      const message = {
-        sender: 'test-agent-1',
-        recipient: 'recipient-1',
-        type: MessageType.TEXT,
-        content: { text: 'Test message' },
-        encrypted: true,
-      };
-
-      const messageId = await hivesync.sendMessage(message);
-
-      expect(messageId).toBeDefined();
-      expect(typeof messageId).toBe('string');
-      expect(mockNode.lightPush.send).toHaveBeenCalledWith(
-        expect.objectContaining({ contentTopic: expect.any(String) }),
-        expect.objectContaining({ payload: expect.any(Uint8Array) })
-      );
-    });
-
-    test('should throw when sending without connection', async () => {
-      const message = {
-        sender: 'test-agent-1',
-        recipient: 'recipient-1',
-        type: MessageType.TEXT,
-        content: { text: 'Test' },
-        encrypted: true,
-      };
-
-      await expect(hivesync.sendMessage(message)).rejects.toThrow(
-        'HiveSync bridge not initialized or connected'
-      );
-    });
+    expect(await waitFor(() => received.length === 1)).toBe(true);
+    expect(received[0].sender).toBe('alice');
+    expect(received[0].content.text).toBe('hi bob');
   });
 
-  describe('Status', () => {
-    test('should return disconnected status initially', () => {
-      const status = hivesync.getStatus();
-      expect(status.connected).toBe(false);
-      expect(status.peers).toBe(0);
-      expect(status.peerId).toBeUndefined();
+  test('a node does not receive its own broadcasts (self-filter)', async () => {
+    const aliceGot: Message[] = [];
+    alice.onMessage(MessageType.TEXT, (m) => aliceGot.push(m));
+
+    await alice.sendMessage({
+      sender: 'alice',
+      recipient: 'broadcast',
+      type: MessageType.TEXT,
+      content: { text: 'anyone there?' },
+      encrypted: false,
     });
 
-    test('should return connected status with peer info', () => {
-      const mockNode = createMockNode();
-      // @ts-ignore
-      hivesync['node'] = mockNode;
-      // @ts-ignore
-      hivesync['isConnected'] = true;
-
-      const status = hivesync.getStatus();
-      expect(status.connected).toBe(true);
-      expect(status.peerId).toBe('test-peer-id');
-    });
+    await tick();
+    await tick();
+    expect(aliceGot).toHaveLength(0);
   });
 
-  describe('Error Handling', () => {
-    test('should handle initialization failure gracefully', async () => {
-      const { createLightNode } = require('@waku/sdk');
-      createLightNode.mockRejectedValue(new Error('Connection failed'));
+  test('end-to-end encrypts directed messages once keys are known', async () => {
+    await waitFor(() => alice.getKnownAgents().some((a) => a.id === 'bob'));
 
-      const result = await hivesync.initialize();
-      expect(result).toBe(false);
-      expect(hivesync.getStatus().connected).toBe(false);
+    const got: Message[] = [];
+    bob.onMessage(MessageType.TEXT, (m) => got.push(m));
+
+    await alice.sendMessage({
+      sender: 'alice',
+      recipient: 'bob',
+      type: MessageType.TEXT,
+      content: { text: 'classified' },
+      encrypted: true,
     });
 
-    test('should propagate message sending errors', async () => {
-      const mockNode = createMockNode();
-      mockNode.lightPush.send.mockRejectedValue(new Error('Network error'));
-      // @ts-ignore
-      hivesync['node'] = mockNode;
-      // @ts-ignore
-      hivesync['isConnected'] = true;
+    expect(await waitFor(() => got.length === 1)).toBe(true);
+    expect(got[0].encrypted).toBe(true);
+    expect(got[0].content.text).toBe('classified');
+  });
 
-      const message = {
-        sender: 'test-agent-1',
-        recipient: 'recipient-1',
-        type: MessageType.TEXT,
-        content: { text: 'Test' },
-        encrypted: true,
-      };
+  test('drops frames with an invalid signature', async () => {
+    const transport = new InMemoryTransport(TOPIC, 'attacker');
+    await transport.start();
 
-      await expect(hivesync.sendMessage(message)).rejects.toThrow('Network error');
+    const got: Message[] = [];
+    bob.onMessage(MessageType.TEXT, (m) => got.push(m));
+
+    // A forged envelope: signed field present but bogus.
+    const forged = {
+      v: 1,
+      id: 'forged-1',
+      from: 'mallory',
+      to: 'bob',
+      type: MessageType.TEXT,
+      ts: Date.now(),
+      spk: Identity.ephemeral('mallory', 'M').signPublicKey,
+      sig: Buffer.from('garbage').toString('base64'),
+      enc: false,
+      body: JSON.stringify({ text: 'spoofed' }),
+    };
+    await transport.publish(Buffer.from(JSON.stringify(forged)));
+
+    await tick();
+    await tick();
+    expect(got).toHaveLength(0);
+    await transport.stop();
+  });
+
+  test('de-duplicates redelivered frames', async () => {
+    await waitFor(() => alice.getKnownAgents().some((a) => a.id === 'bob'));
+    const got: Message[] = [];
+    bob.onMessage(MessageType.TEXT, (m) => got.push(m));
+
+    // Capture a real signed frame Alice emits, then replay it twice.
+    const sniffer = new InMemoryTransport(TOPIC, 'sniffer');
+    await sniffer.start();
+    let frame: Uint8Array | null = null;
+    await sniffer.subscribe((p) => {
+      const env = JSON.parse(Buffer.from(p).toString());
+      if (env.type === MessageType.TEXT && env.from === 'alice') frame = p;
     });
 
-    test('should handle disconnect when not connected', async () => {
-      await expect(hivesync.disconnect()).resolves.not.toThrow();
+    await alice.sendMessage({
+      sender: 'alice',
+      recipient: 'bob',
+      type: MessageType.TEXT,
+      content: { text: 'dupe-me' },
+      encrypted: false,
     });
+
+    expect(await waitFor(() => frame !== null)).toBe(true);
+    await sniffer.publish(frame!);
+    await sniffer.publish(frame!);
+    await tick();
+    await tick();
+
+    expect(got.filter((m) => m.content.text === 'dupe-me')).toHaveLength(1);
+    await sniffer.stop();
+  });
+
+  test('fires onAgentDiscovered exactly once per new agent', async () => {
+    const carol = makeNode('carol').node;
+    const discovered: AgentIdentity[] = [];
+    carol.onAgentDiscovered((a) => discovered.push(a));
+    await carol.initialize(0);
+
+    await waitFor(() => discovered.length >= 2, 2000);
+    const ids = discovered.map((d) => d.id).sort();
+    // Discovered alice & bob, each once.
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(ids).toEqual(expect.arrayContaining(['alice', 'bob']));
+
+    await carol.disconnect();
   });
 });

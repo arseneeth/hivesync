@@ -5,6 +5,47 @@ All notable changes to HiveSync will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] - 2026-06-17
+
+A near-complete rewrite of the networking core to make HiveSync actually run
+against real Waku, with working agent discovery and genuine end-to-end
+encryption.
+
+### Fixed
+- **Runtime-breaking**: `@waku/sdk` is ESM-only but the project builds to
+  CommonJS — the old code could not `require()` it. Upgraded to `@waku/sdk`
+  `0.0.36` and load it via dynamic `import()`.
+- **Waku API**: malformed content topics and missing `routingInfo` (the old
+  `createEncoder/createDecoder` calls crash on current SDKs). Now uses the
+  node's network-config-aware encoder/decoder and a valid content topic.
+- Default config no longer enables Obsidian sync against a non-existent vault
+  (which previously made `bridge.start()` fail by default).
+- Received messages with a deserialized (string) timestamp no longer crash on
+  save; duplicate message ids are ignored (`INSERT OR IGNORE`).
+- Consistent identity: messages are addressed and signed by `agentId`, not the
+  transport `peerId`.
+
+### Added
+- **Agent discovery**: ANNOUNCE/presence protocol — agents broadcast their
+  identity + public keys and learn about each other (`getKnownAgents`,
+  `waitForAgent`, `onAgentDiscovered`).
+- **Real end-to-end encryption**: persistent Ed25519 (sign) + X25519 (encrypt)
+  identity on disk; ECDH + AES-256-GCM for directed messages; signature
+  verification on every frame; TOFU key pinning.
+- **Pluggable `Transport`**: `WakuTransport` (real) and `InMemoryTransport`
+  (deterministic tests).
+- Self-echo filtering, message de-duplication, and LightPush retry/back-off.
+- Anti-loop guard for Obsidian sync (don't re-broadcast notes we just wrote).
+- A real end-to-end test that spawns two agent **processes** that discover each
+  other and exchange an encrypted message over the live Waku network.
+
+### Changed
+- `BridgeConfig.waku` now uses `clusterId`, `numShardsInCluster`, and
+  `contentTopic` (replacing `pubsubTopic`); `bootstrapNodes` empty means the
+  default Waku Network bootstrap. `obsidian` sync is opt-in.
+- `BridgeManager.getStatus()` is now async and reports live peer/known-agent
+  counts.
+
 ## [1.0.0] - 2026-04-04
 
 ### Added

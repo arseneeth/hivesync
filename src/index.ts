@@ -1,5 +1,9 @@
 export { BridgeManager } from './core/bridge-manager';
 export { HiveSync } from './core/hivesync-bridge';
+export { Identity } from './core/identity';
+export { WakuTransport } from './core/waku-transport';
+export { Transport, InMemoryTransport } from './core/transport';
+export * as crypto from './core/crypto';
 export { StorageManager } from './storage/storage-manager';
 export { RealTimeSyncManager } from './sync/real-time-sync';
 export { ObsidianSyncManager } from './sync/obsidian-sync';

@@ -1,7 +1,6 @@
 import sqlite3 from 'sqlite3';
 import { open } from 'sqlite';
 import { Message, AgentIdentity, ObsidianNote, SyncState } from '../types';
-import { v4 as uuidv4 } from 'uuid';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -52,6 +51,8 @@ export class StorageManager {
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
         public_key TEXT NOT NULL,
+        enc_public_key TEXT,
+        key_id TEXT,
         created_at DATETIME NOT NULL,
         last_seen DATETIME,
         trusted INTEGER DEFAULT 0
@@ -94,8 +95,15 @@ export class StorageManager {
 
   // Message operations
   async saveMessage(message: Message): Promise<void> {
+    // Timestamps may arrive as Date (local) or string/number (deserialized).
+    const timestamp =
+      message.timestamp instanceof Date
+        ? message.timestamp.toISOString()
+        : new Date(message.timestamp).toISOString();
+
+    // INSERT OR IGNORE: the network can redeliver a message we've already stored.
     await this.db.run(
-      `INSERT INTO messages (id, sender, recipient, type, content, timestamp, encrypted, signature)
+      `INSERT OR IGNORE INTO messages (id, sender, recipient, type, content, timestamp, encrypted, signature)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         message.id,
@@ -103,7 +111,7 @@ export class StorageManager {
         message.recipient,
         message.type,
         JSON.stringify(message.content),
-        message.timestamp.toISOString(),
+        timestamp,
         message.encrypted ? 1 : 0,
         message.signature || null
       ]
@@ -154,45 +162,48 @@ export class StorageManager {
 
   // Agent operations
   async saveAgent(agent: AgentIdentity): Promise<void> {
+    // Preserve trust flag and original created_at across re-announcements.
     await this.db.run(
-      `INSERT OR REPLACE INTO agents (id, name, public_key, created_at, last_seen, trusted)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO agents (id, name, public_key, enc_public_key, key_id, created_at, last_seen, trusted)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+       ON CONFLICT(id) DO UPDATE SET
+         name = excluded.name,
+         public_key = excluded.public_key,
+         enc_public_key = excluded.enc_public_key,
+         key_id = excluded.key_id,
+         last_seen = excluded.last_seen`,
       [
         agent.id,
         agent.name,
         agent.publicKey,
+        agent.encPublicKey || null,
+        agent.keyId || null,
         agent.createdAt.toISOString(),
-        new Date().toISOString(),
-        0 // Default not trusted
+        (agent.lastSeen || new Date()).toISOString(),
       ]
     );
   }
 
-  async getAgent(agentId: string): Promise<AgentIdentity | null> {
-    const row = await this.db.get(
-      `SELECT * FROM agents WHERE id = ?`,
-      [agentId]
-    );
-
-    if (!row) return null;
-
+  private rowToAgent(row: any): AgentIdentity {
     return {
       id: row.id,
       name: row.name,
       publicKey: row.public_key,
+      encPublicKey: row.enc_public_key || undefined,
+      keyId: row.key_id || undefined,
       createdAt: new Date(row.created_at),
+      lastSeen: row.last_seen ? new Date(row.last_seen) : undefined,
     };
+  }
+
+  async getAgent(agentId: string): Promise<AgentIdentity | null> {
+    const row = await this.db.get(`SELECT * FROM agents WHERE id = ?`, [agentId]);
+    return row ? this.rowToAgent(row) : null;
   }
 
   async getAllAgents(): Promise<AgentIdentity[]> {
     const rows = await this.db.all(`SELECT * FROM agents ORDER BY last_seen DESC`);
-
-    return rows.map((row: any) => ({
-      id: row.id,
-      name: row.name,
-      publicKey: row.public_key,
-      createdAt: new Date(row.created_at),
-    }));
+    return rows.map((row: any) => this.rowToAgent(row));
   }
 
   async updateAgentLastSeen(agentId: string): Promise<void> {

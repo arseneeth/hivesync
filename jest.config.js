@@ -11,9 +11,8 @@ module.exports = {
   ],
   coverageDirectory: 'coverage',
   coverageReporters: ['text', 'lcov'],
-  moduleNameMapper: {
-    '^@waku/sdk$': '<rootDir>/__mocks__/@waku/sdk.js',
-  },
+  // No Waku mock: unit/integration tests inject InMemoryTransport, and the e2e
+  // suite spawns real processes that talk to the live Waku network.
   transform: {
     '^.+\\.tsx?$': ['ts-jest', { diagnostics: false }],
   },

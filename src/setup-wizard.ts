@@ -4,6 +4,7 @@ import ora from 'ora';
 import * as fs from 'fs';
 import * as path from 'path';
 import { v4 as uuidv4 } from 'uuid';
+import yaml from 'yaml';
 import { BridgeConfig } from './types';
 import { logger } from './utils/logger';
 
@@ -96,16 +97,16 @@ export async function runSetupWizard(): Promise<void> {
       agentId: answers.agentId,
       agentName: answers.agentName,
       storagePath: answers.storagePath,
-      syncInterval: answers.enableRealtimeSync ? 1 : 0, // 1 minute interval for periodic checks
+      syncInterval: 30, // presence announce interval (seconds)
       waku: {
         listenAddresses: ['/ip4/0.0.0.0/tcp/0/ws'],
+        // Empty => default bootstrap (The Waku Network).
         bootstrapNodes: answers.useCustomNodes
           ? answers.customNodes.split('\n').filter((n: string) => n.trim())
-          : [
-              '/dns4/node-01.do-ams3.wakuv2.test.status.im/tcp/443/wss/p2p/16Uiu2HAmPLe7Mzm8TsYUubgCAW1aJoeFScxrLj8ppHFivPo97bUZ',
-              '/dns4/node-01.gc-us-central1-a.wakuv2.test.status.im/tcp/443/wss/p2p/16Uiu2HAmJb2e28qLXxT5kZxVUUoJt72EMzNGXB47Rxx5hw3q4YjS',
-            ],
-        pubsubTopic: '/waku/2/hivesync/proto',
+          : [],
+        clusterId: 1,
+        numShardsInCluster: 8,
+        contentTopic: '/hivesync/1/agents/proto',
         keepAlive: true,
         maxPeers: 10,
       },
@@ -113,19 +114,9 @@ export async function runSetupWizard(): Promise<void> {
 
     // Add Obsidian configuration if enabled
     if (answers.enableRealtimeSync) {
-      (config as any).obsidian = {
+      config.obsidian = {
         vaultPath: answers.obsidianPath,
-        syncDebounceDelay: answers.syncDebounceDelay,
-        autoSync: true,
-        ignorePatterns: [
-          '.trash/**',
-          '.obsidian/**',
-          '.git/**',
-          '*.tmp',
-          '*.swp',
-          '*.swo',
-          '*.DS_Store'
-        ],
+        enabled: true,
       };
     }
 
@@ -143,9 +134,8 @@ export async function runSetupWizard(): Promise<void> {
 
     // Save config
     const configPath = path.join(configDir, 'hivesync.yaml');
-    const yaml = require('yaml');
     const yamlStr = yaml.stringify(config);
-    
+
     fs.writeFileSync(configPath, yamlStr, 'utf-8');
 
     // Create .env file if needed

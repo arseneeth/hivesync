@@ -197,6 +197,53 @@ describe('StorageManager', () => {
     });
   });
 
+  describe('Robustness', () => {
+    test('should ignore duplicate message ids (network redelivery)', async () => {
+      const msg: Message = {
+        id: 'dup-1',
+        sender: 'a',
+        recipient: 'b',
+        type: MessageType.TEXT,
+        content: { text: 'once' },
+        timestamp: new Date(),
+        encrypted: false,
+      };
+      await storage.saveMessage(msg);
+      await expect(storage.saveMessage(msg)).resolves.not.toThrow();
+      const all = await storage.getMessages(10, 0);
+      expect(all.filter((m) => m.id === 'dup-1')).toHaveLength(1);
+    });
+
+    test('should accept a non-Date (deserialized) timestamp', async () => {
+      const msg: any = {
+        id: 'str-ts',
+        sender: 'a',
+        recipient: 'b',
+        type: MessageType.TEXT,
+        content: { text: 'hi' },
+        timestamp: new Date().toISOString(), // string, as it arrives over the wire
+        encrypted: false,
+      };
+      await expect(storage.saveMessage(msg)).resolves.not.toThrow();
+      const all = await storage.getMessages(10, 0);
+      expect(all[0].timestamp).toBeInstanceOf(Date);
+    });
+
+    test('should persist signing and encryption keys for agents', async () => {
+      await storage.saveAgent({
+        id: 'keyed',
+        name: 'Keyed',
+        publicKey: 'sign-pub',
+        encPublicKey: 'enc-pub',
+        keyId: 'fp-123',
+        createdAt: new Date(),
+      });
+      const a = await storage.getAgent('keyed');
+      expect(a!.encPublicKey).toBe('enc-pub');
+      expect(a!.keyId).toBe('fp-123');
+    });
+  });
+
   describe('Sync State', () => {
     test('should update and retrieve sync state', async () => {
       await storage.updateSyncState('agent-1', 5, 2);
