@@ -389,7 +389,12 @@ export async function startTui(
   }
 
   // Ask for the peer's password (session-only), then open the chat.
+  // If a password was already provided this session, skip the prompt.
   function openAgent(peer: string): void {
+    if (bridge.hasAgentPassword(peer)) {
+      void showChat(peer);
+      return;
+    }
     pendingPeer = peer;
     const nm = nameFor(peer);
     pwLabel.setContent(
