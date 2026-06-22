@@ -31,6 +31,22 @@ async function waitFor(pred: () => boolean | Promise<boolean>, ms = 2000): Promi
   return Boolean(await pred());
 }
 
+/**
+ * Establish mutual trust: each side approves the other's auto-initiated
+ * handshake. Messages are quarantined until the handshake is confirmed, so any
+ * test that exchanges trusted messages must do this first.
+ */
+async function establishTrust(a: BridgeManager, b: BridgeManager, aId: string, bId: string): Promise<void> {
+  await a.waitForAgent(bId, 5000);
+  await b.waitForAgent(aId, 5000);
+  await waitFor(async () => (await b.getPendingApprovals()).some((x) => x.agentId === aId), 8000);
+  await b.approveHandshake(aId);
+  await waitFor(() => b.getHandshakeStatus(aId)?.status === 'confirmed', 5000);
+  await waitFor(async () => (await a.getPendingApprovals()).some((x) => x.agentId === bId), 8000);
+  await a.approveHandshake(bId);
+  await waitFor(() => a.getHandshakeStatus(bId)?.status === 'confirmed', 5000);
+}
+
 describe('BridgeManager communication (in-memory transport)', () => {
   let alpha: BridgeManager;
   let beta: BridgeManager;
@@ -65,7 +81,7 @@ describe('BridgeManager communication (in-memory transport)', () => {
   test('delivers an encrypted directed text message end to end', async () => {
     await alpha.start();
     await beta.start();
-    expect(await alpha.waitForAgent('agent-beta', 2000)).toBe(true);
+    await establishTrust(alpha, beta, 'agent-alpha', 'agent-beta');
 
     await alpha.sendTextMessage('agent-beta', 'hello beta');
 
@@ -79,13 +95,12 @@ describe('BridgeManager communication (in-memory transport)', () => {
     const text = msgs.find((m) => m.content.text === 'hello beta')!;
     expect(text.sender).toBe('agent-alpha');
     expect(text.encrypted).toBe(true); // beta's key was known => encrypted
-  });
+  }, 20000);
 
   test('supports a bidirectional exchange (reply)', async () => {
     await alpha.start();
     await beta.start();
-    expect(await alpha.waitForAgent('agent-beta', 2000)).toBe(true);
-    expect(await beta.waitForAgent('agent-alpha', 2000)).toBe(true);
+    await establishTrust(alpha, beta, 'agent-alpha', 'agent-beta');
 
     // beta replies as soon as it hears from alpha
     beta.on('text', async (m) => {
@@ -99,12 +114,12 @@ describe('BridgeManager communication (in-memory transport)', () => {
       return msgs.some((m) => m.content.text === 'got it');
     });
     expect(gotReply).toBe(true);
-  });
+  }, 20000);
 
   test('records both sides of a conversation in history', async () => {
     await alpha.start();
     await beta.start();
-    expect(await alpha.waitForAgent('agent-beta', 2000)).toBe(true);
+    await establishTrust(alpha, beta, 'agent-alpha', 'agent-beta');
 
     await alpha.sendTextMessage('agent-beta', 'first');
     await waitFor(async () => (await beta.getUnreadMessages()).some((m) => m.content.text === 'first'));
@@ -117,12 +132,12 @@ describe('BridgeManager communication (in-memory transport)', () => {
     // outgoing 'first' is attributed to us, incoming 'second' to the peer
     expect(convo.find((m) => m.content.text === 'first')!.sender).toBe('agent-alpha');
     expect(convo.find((m) => m.content.text === 'second')!.sender).toBe('agent-beta');
-  });
+  }, 20000);
 
   test('broadcast reaches the other agent but not the sender', async () => {
     await alpha.start();
     await beta.start();
-    await alpha.waitForAgent('agent-beta', 2000);
+    await establishTrust(alpha, beta, 'agent-alpha', 'agent-beta');
 
     await alpha.broadcastMessage('hello everyone');
 
@@ -138,12 +153,12 @@ describe('BridgeManager communication (in-memory transport)', () => {
     const alphaCopies = (await alpha.getBroadcasts()).filter((m) => m.content.text === 'hello everyone');
     expect(alphaCopies).toHaveLength(1);
     expect(alphaCopies[0].sender).toBe('agent-alpha');
-  });
+  }, 20000);
 
   test('command messages trigger handled responses', async () => {
     await alpha.start();
     await beta.start();
-    await alpha.waitForAgent('agent-beta', 2000);
+    await establishTrust(alpha, beta, 'agent-alpha', 'agent-beta');
 
     await alpha.sendCommand('agent-beta', 'help');
 
@@ -154,7 +169,7 @@ describe('BridgeManager communication (in-memory transport)', () => {
         return msgs.some((m) => typeof m.content.text === 'string' && m.content.text.includes('Commands'));
       })
     ).toBe(true);
-  });
+  }, 20000);
 
   describe('lifecycle', () => {
     test('stop is safe before start and idempotent', async () => {

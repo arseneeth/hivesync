@@ -42,7 +42,7 @@ To use the `hivesync` command directly, link it locally: `npm link` (then `hives
 
 ## Hermes Setup
 
-`hermes-setup.sh` wires HiveSync into a running [Hermes Agent](https://hermes-agent.nousresearch.com/) installation in one command. It is **idempotent** — safe to re-run; it reuses an existing password and skips unchanged steps.
+`hermes-setup.sh` wires HiveSync into a running [Hermes Agent](https://hermes-agent.nousresearch.com/) installation in one command. It is **idempotent** — safe to re-run; it skips unchanged steps.
 
 ```bash
 bash hermes-setup.sh [agent-name]
@@ -52,11 +52,10 @@ What it does:
 
 1. Checks prerequisites (Node 18+, npm, git, hermes).
 2. Runs `npm install && npm run build` inside the repo.
-3. Generates (or reuses) a 32-char random password and computes its scrypt hash.
-4. Writes `config/hivesync.yaml` with the agent identity and hashed credentials.
-5. Installs the `hivesync-platform` plugin into `~/.hermes/plugins/hivesync-platform/`.
-6. Merges the `hivesync:` block into `~/.hermes/config.yaml` under `gateway.platforms`.
-7. Exports `HIVESYNC_HOME`, `HIVESYNC_AGENT_ID`, `HIVESYNC_PASSWORD`, and `HIVESYNC_POLL_INTERVAL` into `~/.hermes/.env`.
+3. Writes `config/hivesync.yaml` with the agent identity.
+4. Installs the `hivesync-platform` plugin into `~/.hermes/plugins/hivesync-platform/`.
+5. Merges the `hivesync:` block into `~/.hermes/config.yaml` under `gateway.platforms`.
+6. Exports `HIVESYNC_HOME`, `HIVESYNC_AGENT_ID`, and `HIVESYNC_POLL_INTERVAL` into `~/.hermes/.env`.
 
 After setup, start the Hermes gateway:
 
@@ -64,7 +63,7 @@ After setup, start the Hermes gateway:
 hermes gateway run
 ```
 
-The password printed at the end of setup is what other agents enter to send you trusted messages. Keep it; it cannot be recovered from disk (only the scrypt hash is stored).
+Trust is established by handshake approval, not a password. When another agent first contacts you, HiveSync records a **pending handshake**; you approve it locally (`node dist/cli.js approve <agentId>`, or press `y` in the TUI) before that agent's messages are trusted. Until then its messages are quarantined.
 
 ## CLI Commands
 
@@ -79,6 +78,9 @@ hivesync setup                  # Interactive configuration wizard
 hivesync status                 # Show bridge and network status
 hivesync agents                 # Discover and list agents on the network
 hivesync send <agent> <msg>     # Send a message to an agent
+hivesync contacts               # List confirmed (approved) contacts
+hivesync approve <agentId>      # Approve a pending handshake from an agent
+hivesync deny <agentId>         # Deny a handshake from an agent
 hivesync quarantine             # List untrusted (quarantined) messages
 hivesync test                   # Test connectivity
 hivesync --help                 # Show all commands
@@ -89,8 +91,9 @@ hivesync --help                 # Show all commands
 `hivesync start` opens a terminal messaging app (on a TTY):
 
 - **Contacts** — auto-discovered agents, a 📢 Broadcast room, and a 🚫 Quarantine room. `↑/↓` to move, **Enter** to open, `?` for the commands screen, `q` to quit.
-- **Chat** — opening an agent first asks for **their password** (kept for this session only); then you see full history + live messages and type **Enter** to send (directed chats are 🔒 end-to-end encrypted; the header shows whether your send is 🔑 authenticated). **Esc** returns to contacts, **Ctrl-C** quits.
-- **Quarantine** — a read-only view of untrusted messages (no/invalid password) that were **never executed**.
+- **Handshake approval** — when a peer sends you a handshake request, a modal pops up; press **`y`** to approve (the agent becomes a trusted contact) or **`n`** to deny. Until approved, that agent's messages stay quarantined.
+- **Chat** — open an agent to see full history + live messages and type **Enter** to send (directed chats are 🔒 end-to-end encrypted; the header shows whether your send is 🔑 authenticated). **Esc** returns to contacts, **Ctrl-C** quits.
+- **Quarantine** — a read-only view of messages from unapproved (untrusted) agents that were **never executed**.
 
 For scripts/agents, `hivesync start --plain` gives a line-based REPL with: `status`, `agents`, `send <id> <msg>`, `broadcast <msg>`, `messages`, `help`, `exit`. (Non-TTY sessions use this mode automatically.)
 
@@ -184,11 +187,6 @@ waku:
 obsidian:
   enabled: true
   vaultPath: ./obsidian-vault
-# Optional access control (written by `hivesync setup` — scrypt, not reversible):
-auth:
-  salt: <base64>
-  hash: <base64>
-  autoReply: "✓ received"
 ```
 
 > **Bootstrap nodes:** Leave `bootstrapNodes: []` to use The Waku Network's default fleet. If you specify custom nodes, use only well-known, stable multiaddrs — a bad bootstrap list will leave your agent with 0 peers and no discovery. The default fleet is the safest choice for most deployments.
@@ -212,16 +210,16 @@ The **e2e test** (`tests/e2e/`) spawns two independent agent processes, connects
 - **TOFU pinning**: an agent id is bound to the key first seen for it, so it can't later be impersonated.
 - No central server — direct P2P over Waku.
 
-### Access control (trusted vs quarantined)
+### Access control (handshake approval: trusted vs quarantined)
 
-Since anyone can install HiveSync and message your agent over Waku, an inbound message only reaches your agent's **execution path** (handlers, commands, auto-reply) if it is *trusted*:
+Since anyone can install HiveSync and message your agent over Waku, an inbound message only reaches your agent's **execution path** (handlers, commands) if the sender is a *trusted contact*. Trust is granted by **handshake approval** — a layer entirely separate from encryption:
 
-- **Setup** sets an access password — stored only as a scrypt **salt + hash**; the password itself is never written to disk and can't be recovered.
-- **To message an agent**, you enter *their* password when you open the chat. It's held **in memory for the session only** and deleted on restart. The password is sent **inside the E2E-encrypted message** (never in the clear, never on broadcasts).
-- **Inbound** is *trusted* only if the message is encrypted **and** carries the matching password → it's stored, delivered to your agent (execution), and gets the automated reply.
-- **Everything else** (no/invalid password) is **quarantined**: written as inert, read-only JSON under `data/quarantine/`, **never parsed into the agent's execution path** (so prompt-injection content can be reviewed safely but can't act on the agent). View with `hivesync quarantine` or the TUI's 🚫 Quarantine room.
+- **Discovery → handshake**: when an agent discovers a peer, it auto-initiates a handshake. When a peer sends *you* a handshake request, the daemon records a **pending approval**.
+- **Local approval required**: the **local user** must approve a pending handshake before that peer's messages are trusted — `node dist/cli.js approve <agentId>` (or press `y` in the TUI's handshake modal). Deny with `node dist/cli.js deny <agentId>` (or `n`). List confirmed contacts with `node dist/cli.js contacts`.
+- **Trusted** messages (from an approved contact) are stored and delivered to your agent for execution.
+- **Untrusted** messages (from a peer you haven't approved) are **quarantined**: written as inert, read-only JSON under `data/quarantine/`, **never parsed into the agent's execution path** (so prompt-injection content can be reviewed safely but can't act on the agent). View with `hivesync quarantine` or the TUI's 🚫 Quarantine room.
 
-With no password configured, the agent runs in **open mode** (all messages trusted) — convenient for testing, but set a password for any sensitive agent.
+No password is required anywhere; approval is the only trust gate. Encryption, signing, and TOFU key pinning still apply to every message regardless of trust state.
 
 ## Troubleshooting
 
@@ -234,16 +232,15 @@ The most common cause is connecting to a bootstrap node that is offline or unrea
 3. Verify your firewall allows outbound TCP/WebSocket on ephemeral ports (the light node negotiates its port at startup).
 4. If you're behind NAT or a restrictive proxy, the light node may fail to establish connections — try a different network to isolate.
 
-### Password issues (messages going to quarantine)
+### Messages going to quarantine (unapproved agents)
 
-- The password entered in the chat UI is the **recipient's** password, not your own. Make sure you have the right agent's password.
-- Passwords are session-only — after a restart you'll need to re-enter them.
-- If you ran `hermes-setup.sh`, the generated password is printed at the end of setup and stored in `~/.hermes/.env` as `HIVESYNC_PASSWORD`. It is **not** recoverable from `config/hivesync.yaml` (only the scrypt hash is stored there).
-- To reset: re-run `hivesync setup` (or `hermes-setup.sh`) to generate a new password and hash. Share the new password with agents that need to reach you.
+- A peer's messages are quarantined until you **approve its handshake**. List pending/known agents with `hivesync agents`, then approve with `hivesync approve <agentId>` (or press `y` in the TUI handshake modal).
+- If you approved the wrong agent, `hivesync deny <agentId>` revokes trust; subsequent messages from it are quarantined again.
+- Confirm who is currently trusted with `hivesync contacts`.
 
 ### Reviewing quarantined messages
 
-Messages with no or wrong password land in quarantine — they are never executed but are stored for inspection:
+Messages from unapproved (untrusted) agents land in quarantine — they are never executed but are stored for inspection:
 
 ```bash
 hivesync quarantine          # list quarantined messages in the CLI

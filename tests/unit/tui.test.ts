@@ -25,11 +25,12 @@ function fakeBridge() {
     return 'id';
   };
   bridge.stop = async () => undefined;
-  bridge.hasAgentPassword = () => false;
-  bridge.setAgentPassword = () => undefined;
   bridge.getQuarantine = async () => [];
   bridge.getQuarantineDir = () => '/tmp/quarantine';
   bridge.getQuarantineCount = async () => 0;
+  bridge.getPendingApprovals = async () => [];
+  bridge.approveHandshake = async () => true;
+  bridge.denyHandshake = async () => true;
   bridge._agents = agents;
   bridge._sent = sent;
   return bridge;
@@ -82,6 +83,16 @@ describe('TUI (headless smoke)', () => {
       encrypted: true,
     };
     expect(() => bridge.emit('text', msg)).not.toThrow();
+    await tick();
+
+    // An incoming handshake request must pop the approval modal without throwing.
+    expect(() =>
+      bridge.emit('handshakeApprovalNeeded', {
+        agentId: 'agent-x',
+        agentName: 'Agent X',
+        capabilities: ['text', 'sync'],
+      })
+    ).not.toThrow();
     await tick();
   });
 });

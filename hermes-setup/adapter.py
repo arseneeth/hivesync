@@ -15,13 +15,15 @@ Configuration in config.yaml::
             home: /path/to/hivesync
             agent_id: everhomie
             db_path: /path/to/hivesync/data/hivesync.db
-            password: "your-password"
             poll_interval: 15
             allowed_users: []
             allow_all: false
 
+Trust is established by the HiveSync daemon via a per-peer handshake the local
+user approves (`node dist/cli.js approve <agent-id>`); there is no password.
+
 Environment variables (override config.yaml):
-    HIVESYNC_HOME, HIVESYNC_AGENT_ID, HIVESYNC_DB_PATH, HIVESYNC_PASSWORD,
+    HIVESYNC_HOME, HIVESYNC_AGENT_ID, HIVESYNC_DB_PATH,
     HIVESYNC_POLL_INTERVAL, HIVESYNC_ALLOWED_USERS, HIVESYNC_ALLOW_ALL_USERS
 """
 
@@ -61,14 +63,14 @@ def _read_db(db_path, last_ts, our_agent):
         cur = conn.cursor()
         if last_ts:
             cur.execute(
-                "SELECT id, sender, content, timestamp "
+                "SELECT id, sender, recipient, content, timestamp "
                 "FROM messages WHERE timestamp > ? AND sender != ? "
                 "ORDER BY timestamp ASC",
                 (last_ts, our_agent),
             )
         else:
             cur.execute(
-                "SELECT id, sender, content, timestamp "
+                "SELECT id, sender, recipient, content, timestamp "
                 "FROM messages WHERE sender != ? "
                 "ORDER BY timestamp DESC LIMIT 1",
                 (our_agent,),
@@ -166,8 +168,7 @@ def _env_enablement():
     if not home or not agent_id:
         return None
     db_path = os.getenv("HIVESYNC_DB_PATH") or os.path.join(home, "data", "hivesync.db")
-    password = os.getenv("HIVESYNC_PASSWORD", "")
-    extra = {"home": home, "agent_id": agent_id, "db_path": db_path, "password": password}
+    extra = {"home": home, "agent_id": agent_id, "db_path": db_path}
     poll = os.getenv("HIVESYNC_POLL_INTERVAL")
     if poll:
         try:
@@ -200,7 +201,6 @@ class HiveSyncAdapter(BasePlatformAdapter):
         self.agent_id = os.getenv("HIVESYNC_AGENT_ID") or extra.get("agent_id", "everhomie")
         self.db_path = os.getenv("HIVESYNC_DB_PATH") or extra.get("db_path",
                         os.path.join(self.home, "data", "hivesync.db"))
-        self.password = os.getenv("HIVESYNC_PASSWORD") or extra.get("password", "")
         try:
             self.poll_interval = int(
                 os.getenv("HIVESYNC_POLL_INTERVAL") or extra.get("poll_interval", 30)
@@ -219,6 +219,12 @@ class HiveSyncAdapter(BasePlatformAdapter):
         self._poll_task = None
         self._last_poll_ts = 0.0
         self._known_agents = {}
+        # Message ids already relayed to Hermes/Telegram. Guarantees we never
+        # send a duplicate notification even if a poll batch is replayed (e.g.
+        # after a transient handle_message failure or a cursor that didn't
+        # advance). Bounded so it can't grow without limit.
+        self._relayed_ids: Set[str] = set()
+        self._relayed_order: List[str] = []
 
     @property
     def name(self):
@@ -240,6 +246,26 @@ class HiveSyncAdapter(BasePlatformAdapter):
             except (json.JSONDecodeError, TypeError):
                 return content
         return str(content)
+
+    def _watermark(self, sender, recipient, text):
+        """Tag a relayed message so the user can tell HiveSync agent traffic
+        apart from messages addressed directly to them (see issues #24 / #10).
+
+        Renders a `[HiveSync]` watermark plus from/to routing, e.g.::
+
+            🐝 [HiveSync] claw → you
+            <message text>
+        """
+        target = "everyone" if recipient == "broadcast" else "you"
+        return f"🐝 [HiveSync] {sender} → {target}\n{text}"
+
+    def _remember_relayed(self, msg_id):
+        """Record a relayed message id, bounding the dedup set's size."""
+        self._relayed_ids.add(msg_id)
+        self._relayed_order.append(msg_id)
+        if len(self._relayed_order) > 5000:
+            old = self._relayed_order.pop(0)
+            self._relayed_ids.discard(old)
 
     async def connect(self):
         if not os.path.exists(self.db_path):
@@ -280,19 +306,25 @@ class HiveSyncAdapter(BasePlatformAdapter):
         rows = _read_db(self.db_path, self._last_seen_ts, self.agent_id)
         if not rows:
             return
-        last_ts = ""
         for row in rows:
             msg_id = row["id"]
             sender = row["sender"]
+            recipient = row["recipient"]
             content = row["content"]
             timestamp = row["timestamp"]
             if sender == self.agent_id:
                 continue
+            # Dedup: never relay the same message twice, even if a batch is
+            # replayed after a transient failure.
+            if msg_id in self._relayed_ids:
+                self._advance_cursor(timestamp)
+                continue
             if not self._is_authorized(sender):
                 logger.info("HiveSync: unauthorized sender '%s' blocked", sender)
+                self._advance_cursor(timestamp)
                 continue
             self._known_agents[sender] = sender
-            text = self._extract_text(content)
+            text = self._watermark(sender, recipient, self._extract_text(content))
             source = self.build_source(
                 chat_id=sender, chat_name=sender, chat_type="dm",
                 user_id=sender, user_name=sender, message_id=msg_id,
@@ -304,15 +336,22 @@ class HiveSyncAdapter(BasePlatformAdapter):
                     if timestamp else datetime.now(),
             )
             await self.handle_message(event)
-            last_ts = timestamp
-        if last_ts and last_ts > self._last_seen_ts:
-            self._last_seen_ts = last_ts
-            try:
-                state_file = Path(self.home) / "data" / ".hermes-last-ts"
-                state_file.parent.mkdir(parents=True, exist_ok=True)
-                state_file.write_text(last_ts)
-            except Exception:
-                pass
+            # Mark relayed and advance the cursor only after a successful
+            # hand-off, so a failure mid-batch can't skip an undelivered message.
+            self._remember_relayed(msg_id)
+            self._advance_cursor(timestamp)
+
+    def _advance_cursor(self, timestamp):
+        """Move the timestamp cursor forward and persist it (best-effort)."""
+        if not timestamp or timestamp <= self._last_seen_ts:
+            return
+        self._last_seen_ts = timestamp
+        try:
+            state_file = Path(self.home) / "data" / ".hermes-last-ts"
+            state_file.parent.mkdir(parents=True, exist_ok=True)
+            state_file.write_text(timestamp)
+        except Exception:
+            pass
 
     async def send(self, chat_id, content, reply_to=None, metadata=None):
         result = await _send_hivesync(self.cli_path, chat_id, content)

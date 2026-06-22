@@ -25,11 +25,11 @@ graph TB
     subgraph Core["HiveSync Core"]
         HS["HiveSync\n(hivesync-bridge.ts)\n• envelope framing\n• Ed25519 signing\n• X25519 encryption\n• TOFU pinning\n• peer discovery\n• ACK dispatch\n• seen-ID dedup"]
         ID["Identity\n(identity.ts)\n• loadOrCreate / ephemeral\n• sign / verify\n• encryptFor / decrypt"]
-        CR["Crypto primitives\n(crypto.ts)\n• Ed25519 sign/verify\n• X25519 ECDH\n• AES-256-GCM\n• scrypt hash/verify\n• SHA-256 fingerprint"]
+        CR["Crypto primitives\n(crypto.ts)\n• Ed25519 sign/verify\n• X25519 ECDH\n• AES-256-GCM\n• SHA-256 fingerprint"]
     end
 
     subgraph Manager["Bridge Manager (bridge-manager.ts)"]
-        BM["BridgeManager\n• access-control classify()\n• auto-reply anti-loop\n• EventEmitter API\n  text / message /\n  quarantine /\n  agentDiscovered"]
+        BM["BridgeManager\n• handshake-trust classify()\n• handshake approvals\n• EventEmitter API\n  text / message /\n  quarantine /\n  handshakeApprovalNeeded /\n  agentDiscovered"]
     end
 
     subgraph Storage["Storage Layer"]
@@ -43,14 +43,14 @@ graph TB
     end
 
     subgraph UI["User Interfaces"]
-        TUI["TUI\n(tui.ts)\n• blessed full-screen\n• alt-screen buffer\n• sidebar chat list\n• message bubbles\n• password prompt\n• quarantine viewer"]
+        TUI["TUI\n(tui.ts)\n• blessed full-screen\n• alt-screen buffer\n• sidebar chat list\n• message bubbles\n• handshake approval modal (y/n)\n• quarantine viewer"]
         REPL["Interactive REPL\n(interactive.ts)\n• readline line-mode\n• non-TTY / piped"]
-        CLI["CLI Commands\n(cli.ts / commander)\n• start · setup · status\n• send · agents\n• quarantine · sync\n• sync-status · test"]
+        CLI["CLI Commands\n(cli.ts / commander)\n• start · setup · status\n• send · agents\n• handshake · contacts\n• approve · deny\n• quarantine · sync\n• sync-status · test"]
     end
 
     subgraph Hermes["Hermes Integration"]
         HA["HiveSyncAdapter\n(adapter.py)\n• polling loop\n• SQLite read-only\n• timestamp cursor\n• CLI send subprocess"]
-        HE["~/.hermes/.env\nHIVESYNC_HOME\nHIVESYNC_AGENT_ID\nHIVESYNC_PASSWORD"]
+        HE["~/.hermes/.env\nHIVESYNC_HOME\nHIVESYNC_AGENT_ID\nHIVESYNC_POLL_INTERVAL"]
     end
 
     WN <-->|"bytes over libp2p/WS"| WT
@@ -92,7 +92,6 @@ sequenceDiagram
     participant U2 as Remote User
 
     U->>BM: sendTextMessage(recipient, text)
-    BM->>BM: attach __auth (session pw) if encrypted
     BM->>HS: sendMessage({type:TEXT, content, encrypted})
     HS->>HS: uuid() + timestamp → Envelope stub
     alt recipient known & encrypted=true
@@ -125,16 +124,13 @@ sequenceDiagram
         HS2->>HS2: body → JSON.parse
     end
     HS2->>BM2: messageHandler(TEXT, message)
-    BM2->>BM2: classify(): strip __auth, check enc+password
-    alt trusted
+    BM2->>BM2: classify(): handshake confirmed for sender?
+    alt trusted (handshake confirmed)
         BM2->>BM2: storage.saveMessage(msg)
         BM2->>U2: emit('text', msg)
-        opt autoReply configured & !isAuto
-            BM2->>HS2: sendText(sender, autoReply, {auto:true})
-        end
         BM2->>HS2: sendAck(messageId, sender)
         HS2->>WT: publish ACK envelope
-    else untrusted
+    else untrusted (handshake not confirmed)
         BM2->>BM2: quarantine.add(msg, reason)
         BM2->>U2: emit('quarantine', msg)
     end
@@ -163,7 +159,7 @@ graph TB
     HS --> WT["WakuTransport\n(core/waku-transport.ts)"]
     HS --> IMT["InMemoryTransport\n(core/transport.ts)"]
 
-    ID --> CR["crypto.ts\n• generateSigningKeyPair\n• generateEncryptionKeyPair\n• sign / verify\n• encrypt / decrypt\n• hashPassword / verifyPassword\n• fingerprint"]
+    ID --> CR["crypto.ts\n• generateSigningKeyPair\n• generateEncryptionKeyPair\n• sign / verify\n• encrypt / decrypt\n• fingerprint"]
 
     RS --> FW["FileWatcher\n(sync/file-watcher.ts)"]
 
@@ -222,9 +218,9 @@ stored in a JSON file at `data/identity-{agentId}.json` with mode `0600`.
 5. The sender's ephemeral public key (`epk`) is included so the recipient can perform
    the same ECDH.
 
-**Password authentication** uses `scryptSync` (N=16384, r=8, p=1 by default) to
-hash the shared secret; only the salt and derived hash are stored on disk.
-Verification uses `timingSafeEqual` to prevent timing attacks.
+Trust between agents is **not** handled here — it is a separate handshake-approval
+layer in `BridgeManager` (§4.4).  Encryption and signing apply to every message
+regardless of whether the peer is trusted.
 
 ---
 
@@ -258,22 +254,25 @@ the same frame twice (Waku can re-deliver frames across relay nodes).
 ### 4.4 Bridge Manager (`src/core/bridge-manager.ts`)
 
 `BridgeManager` is the orchestration and access-control layer.  It wraps
-`HiveSync`, exposes an `EventEmitter` API to the UI, and enforces the password
-trust model.
+`HiveSync`, exposes an `EventEmitter` API to the UI, and enforces the
+**handshake-based trust model** (a layer separate from encryption).
 
 **Access control (`classify`)**:
-- If no password is configured → all messages are trusted (open mode).
-- If a password is configured, a message is trusted only if it is **encrypted**
-  AND carries the matching password inside a `__auth` field embedded in the
-  (encrypted) content.
-- Untrusted messages go to the quarantine store; they are never stored in the main
-  database and never executed.
-- Auto-replies carry a `__auto: true` marker; BridgeManager strips it and uses it
-  to prevent auto-reply storms (A replies to B, B auto-replies to A, repeat).
+- A message is trusted only if its sender has a **confirmed handshake**
+  (`HandshakeStatus === 'confirmed'`).  `HANDSHAKE_INIT`/`HANDSHAKE_ACK` frames
+  bypass this check so trust can be established in the first place.
+- Untrusted messages (sender not yet approved) go to the quarantine store; they
+  are never stored in the main database and never executed.
 
-**Session passwords** (outbound): the TUI prompts the user for the *peer's*
-password when opening a conversation.  This password is kept only in
-`sessionPasswords` (a `Map<agentId, string>`) and is never persisted to disk.
+**Handshake approval**:
+- On discovering a peer, `HiveSync` auto-initiates a handshake.  When a peer sends
+  *us* a `HANDSHAKE_INIT`, `BridgeManager` records a **pending approval** in
+  storage and emits `handshakeApprovalNeeded`.
+- The **local user** approves (`hivesync approve <agentId>`, or `y` in the TUI
+  modal) or denies (`hivesync deny <agentId>`, or `n`).  Because approvals are
+  persisted, `BridgeManager` polls the store and completes handshakes recorded by
+  a separate CLI process; on a confirmed handshake the peer is promoted to a
+  trusted `Contact`.
 
 ---
 
@@ -314,8 +313,8 @@ vault path exists.
 **TUI** (`src/utils/tui.ts`): a Telegram-Desktop-inspired full-screen terminal
 messenger built with `blessed`.  Uses the **alt-screen buffer** (`screen.program.alternateBuffer()`) so the application's output never leaks into the terminal's
 scroll-back history.  Features include coloured monogram "avatars", left/right
-message bubbles, live search filtering, per-peer password modal, and a read-only
-quarantine viewer.
+message bubbles, live search filtering, a handshake approval modal (press `y` to
+approve an incoming handshake, `n` to deny), and a read-only quarantine viewer.
 
 **Interactive REPL** (`src/utils/interactive.ts`): a simple `readline`-based
 line-mode shell.  Used when `--plain` is passed, output is piped (non-TTY), or
@@ -346,6 +345,6 @@ communicate over HiveSync without embedding a Node.js runtime:
    being forwarded to Hermes.
 
 The `hermes-setup.sh` script automates the entire integration: builds HiveSync,
-generates a 32-char random password, computes its scrypt hash, writes
-`config/hivesync.yaml`, copies the adapter into `~/.hermes/plugins/hivesync-platform/`,
-and writes environment variables to `~/.hermes/.env`.
+writes `config/hivesync.yaml`, copies the adapter into
+`~/.hermes/plugins/hivesync-platform/`, and writes environment variables to
+`~/.hermes/.env`.

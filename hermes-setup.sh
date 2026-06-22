@@ -5,7 +5,7 @@
 # Usage:
 #   bash hermes-setup.sh [agent-name]
 #
-# Idempotent: safe to re-run; reuses existing password and skips unchanged steps.
+# Idempotent: safe to re-run; skips unchanged steps.
 # =============================================================================
 
 set -euo pipefail
@@ -72,28 +72,12 @@ info "npm run build..."
 npm run build
 ok "Build complete — dist/cli.js ready"
 
-# ── 4. Generate password + scrypt hash ───────────────────────────────────────
-header "Generating credentials"
+# ── 4. Determine whether config needs (re)writing ─────────────────────────────
+header "Checking config"
 
 mkdir -p "$HERMES_HOME"
 touch "$ENV_FILE"
 
-# Idempotent: reuse existing password from ~/.hermes/.env
-if grep -q "^export HIVESYNC_PASSWORD=" "$ENV_FILE" 2>/dev/null; then
-  PASSWORD=$(grep "^export HIVESYNC_PASSWORD=" "$ENV_FILE" | head -1 | sed 's/^export HIVESYNC_PASSWORD=//')
-  info "Reusing existing password from ~/.hermes/.env"
-else
-  # 32 alphanumeric chars via node crypto (no +/= from base64)
-  PASSWORD=$(node -e "
-    const c = require('crypto');
-    let s = '';
-    while (s.length < 32) s += c.randomBytes(32).toString('base64').replace(/[^a-zA-Z0-9]/g, '');
-    process.stdout.write(s.slice(0, 32));
-  ")
-  info "Generated new 32-char password"
-fi
-
-# Compute scrypt hash only when we need to write a new config
 EXISTING_AGENT=""
 CONFIG_FILE="${REPO_DIR}/config/hivesync.yaml"
 [[ -f "$CONFIG_FILE" ]] && EXISTING_AGENT=$(awk '/^agentId:/{print $2}' "$CONFIG_FILE" | tr -d '"' | tr -d "'")
@@ -103,15 +87,7 @@ NEED_CONFIG=0
 [[ "$EXISTING_AGENT" != "$AGENT_ID" ]] && NEED_CONFIG=1
 
 if [[ "$NEED_CONFIG" -eq 1 ]]; then
-  # salt:hash stored together so we can verify without the plaintext password
-  SCRYPT_COMBINED=$(node -e "
-    const crypto = require('crypto');
-    const password = process.argv[1];
-    const salt = crypto.randomBytes(32);
-    const hash = crypto.scryptSync(password, salt, 64, { N: 16384, r: 8, p: 1 });
-    process.stdout.write(salt.toString('base64') + ':' + hash.toString('base64'));
-  " "$PASSWORD")
-  ok "scrypt hash computed (N=16384)"
+  info "config/hivesync.yaml will be written for agent '${AGENT_ID}'"
 else
   info "config/hivesync.yaml up-to-date for agent '${AGENT_ID}' — skipping regeneration"
 fi
@@ -137,10 +113,6 @@ waku:
   contentTopic: /hivesync/1/agents/proto
   keepAlive: true
   maxPeers: 10
-
-auth:
-  salt: "${SCRYPT_COMBINED}"
-  autoReply: "✓ received"
 
 obsidian:
   enabled: true
@@ -286,7 +258,6 @@ set_env_var() {
 
 set_env_var "HIVESYNC_HOME"          "${REPO_DIR}"
 set_env_var "HIVESYNC_AGENT_ID"      "${AGENT_ID}"
-set_env_var "HIVESYNC_PASSWORD"      "${PASSWORD}"
 set_env_var "HIVESYNC_POLL_INTERVAL" "15"
 
 ok "Environment variables written to ~/.hermes/.env"
@@ -298,11 +269,16 @@ echo -e "${BOLD}${GREEN}  HiveSync + Hermes setup complete!${NC}"
 echo -e "${BOLD}${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 echo -e "  ${BOLD}Agent ID :${NC}  ${AGENT_ID}"
-echo -e "  ${BOLD}Password :${NC}  ${PASSWORD}"
 echo -e "  ${BOLD}Config   :${NC}  ${CONFIG_FILE}"
 echo -e "  ${BOLD}Plugin   :${NC}  ${PLUGIN_DIR}/"
 echo ""
-echo -e "  ${YELLOW}Share the password above with agents you want to allow to message you.${NC}"
+echo -e "  ${CYAN}Trust model (handshake approval):${NC}"
+echo -e "    When another agent first messages you, approve them with:"
+echo -e "      node dist/cli.js approve <their-agent-id>"
+echo -e "    Reject with:"
+echo -e "      node dist/cli.js deny <their-agent-id>"
+echo -e "    Until approved, their messages are held in quarantine:"
+echo -e "      node dist/cli.js quarantine"
 echo ""
 echo -e "  ${CYAN}Start the gateway:${NC}"
 echo -e "    hermes gateway run"

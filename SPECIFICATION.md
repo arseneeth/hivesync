@@ -72,6 +72,8 @@ enum MessageType {
   COMMAND        = 'command',
   ACK            = 'ack',
   ANNOUNCE       = 'announce',
+  HANDSHAKE_INIT = 'handshake_init',
+  HANDSHAKE_ACK  = 'handshake_ack',
 }
 ```
 
@@ -114,25 +116,20 @@ A human-readable message from one agent to another, or to all agents.
 
 ```json
 {
-  "text": "Hello from AI Agent!",
-  "__auth": "optional-plaintext-password",   // present only when encrypted
-  "__auto": true                             // present only for auto-replies
+  "text": "Hello from AI Agent!"
 }
 ```
 
-- `__auth` and `__auto` are stripped by `BridgeManager.classify()` before the
-  message reaches any handler or is stored.
 - Direct messages (`to` ≠ `"broadcast"`) are always sent encrypted when the
   recipient's encryption key is known.
 - Broadcast messages (`to = "broadcast"`) are always plaintext.
 
 **Access control**:
-- If `auth` is configured in `BridgeManager`, a TEXT message is **trusted** only
-  when `enc=true` AND the embedded `__auth` value passes `verifyPassword`.
-- Untrusted TEXT messages are quarantined (see §5.3).
-
-**Auto-reply anti-loop**: BridgeManager checks `isAuto` (the `__auto` field).
-Auto-replies are not themselves auto-replied to, preventing infinite loops.
+- A TEXT message is **trusted** (reaches handlers and is stored) only when the
+  sender has a **confirmed handshake** — i.e. the local user has approved that
+  peer (see §3.1).
+- TEXT messages from peers without a confirmed handshake are quarantined
+  (see §5.3).
 
 **ACK**: after delivering a trusted direct TEXT message, the receiver sends an ACK.
 Broadcast messages do not generate ACKs (avoids storm).
@@ -225,45 +222,70 @@ On-demand full sync of vault notes modified since a given timestamp.
 
 ---
 
-## 3. Authentication
+### 2.7 HANDSHAKE_INIT / HANDSHAKE_ACK
 
-### 3.1 Password-based trust model
+The handshake negotiates capabilities and establishes **trust** between two
+agents.  On discovering a peer, an agent **auto-initiates** a handshake by sending
+a `HANDSHAKE_INIT`.  Handshake messages bypass the trust check (otherwise no peer
+could ever become trusted).
 
-HiveSync uses a **shared-secret access control** model.  Each agent configures a
-password in `config/hivesync.yaml`.  A remote agent must include that password
-inside an E2E-encrypted message for its messages to be trusted.
-
-Trust conditions (all must be true):
-1. The envelope has `enc=true` (message was encrypted, not signed plaintext).
-2. The decrypted content contains `__auth` equal to the expected password.
-3. `verifyPassword(__auth, {salt, hash})` returns `true` (constant-time scrypt
-   comparison).
-
-If any condition fails, or if no `auth` block is configured (open mode), the
-message is either trusted unconditionally (open mode) or quarantined.
-
-### 3.2 Password storage
-
-Only a salt and scrypt-derived hash are stored on disk — the plaintext password is
-**never persisted**.
-
-```yaml
-auth:
-  salt: "<base64 random 16 bytes>"
-  hash: "<base64 scrypt output, 32 bytes>"
-  autoReply: "✓ received"   # optional
+**HANDSHAKE_INIT content** (`HandshakeInitPayload`):
+```json
+{
+  "agentName": "everhomie",
+  "agentVersion": "2.0.0",
+  "capabilities": ["text", "obsidian"],
+  "timestamp": 1750000000000
+}
 ```
 
-scrypt parameters: `N=16384, r=8, p=1, keyLen=32` (Node.js `crypto.scryptSync`
-defaults).
+**HANDSHAKE_ACK content** (`HandshakeAckPayload`):
+```json
+{
+  "accepted": true,
+  "agentName": "everhomie",
+  "agentVersion": "2.0.0",
+  "capabilities": ["text", "obsidian"],
+  "timestamp": 1750000000000,
+  "reason": "pending_approval"
+}
+```
 
-### 3.3 Password setup
+**Approval flow**: when a peer sends you a `HANDSHAKE_INIT`, the daemon records a
+**pending approval** and the **local user** must approve it before the peer's
+messages become trusted.  The handshake reaches `confirmed` only after approval;
+until then the peer's non-handshake messages are quarantined (see §3.1, §5.3).
+`reason: "pending_approval"` in the ACK signals that local approval is still
+needed.
 
-Use the setup wizard (`hivesync setup`) or `hermes-setup.sh`.  The script generates
-a 32-character random alphanumeric password and stores it in `~/.hermes/.env` as
-`HIVESYNC_PASSWORD`.
+---
 
-### 3.4 Encryption flow
+## 3. Trust and Encryption
+
+### 3.1 Handshake-based trust model
+
+Trust is **not** password-based.  A message is trusted only when its sender has a
+**confirmed handshake** (`HandshakeStatus = 'confirmed'`).  This trust layer is
+entirely separate from encryption: every message is signed and (for direct
+messages) encrypted regardless of trust state — see §3.2 and §5.1–5.2.
+
+Lifecycle (`HandshakeStatus`): `none → pending → confirmed` (or `failed`).
+
+1. On discovering a peer, an agent auto-initiates a handshake (`HANDSHAKE_INIT`).
+2. When a peer sends *you* a `HANDSHAKE_INIT`, the daemon records a **pending
+   approval** (`HandshakeApproval`, status `pending`).
+3. The **local user** must approve it (`hivesync approve <agentId>`, or `y` in the
+   TUI handshake modal).  Approval drives the handshake to `confirmed` and the
+   peer becomes a trusted `Contact`.  Denying it (`hivesync deny <agentId>`, or
+   `n`) records status `denied`.
+4. Until the handshake is `confirmed`, that peer's non-handshake messages are
+   **quarantined** (§5.3) — never inserted into the database, never executed.
+
+Approval state is persisted by `StorageManager`; the CLI `approve`/`deny`
+commands record the decision, and the running daemon polls for it (so approval
+works even from a separate process).
+
+### 3.2 Encryption flow
 
 ```
 plaintext (Buffer)
@@ -285,7 +307,7 @@ plaintext (Buffer)
 The recipient reverses this: uses its own X25519 private key + the sender's `epk`
 to derive the same shared key, then decrypts with AES-256-GCM.
 
-### 3.5 Key fingerprint and TOFU
+### 3.3 Key fingerprint and TOFU
 
 ```
 keyId = sha256(signPublicKey_base64) → base64url → first 24 chars
@@ -396,13 +418,13 @@ Format:
   "content": { "text": "..." },
   "timestamp": "2025-06-18T10:00:00.000Z",
   "encrypted": false,
-  "reason": "unauthenticated (not encrypted)",
+  "reason": "untrusted (handshake not confirmed)",
   "quarantinedAt": "2025-06-18T10:00:00.000Z"
 }
 ```
 
-`reason` values: `"missing or invalid password"`, `"unauthenticated (not encrypted)"`,
-`"quarantined"` (open-mode fallback).
+`reason` is `"untrusted (handshake not confirmed)"` — the sender has no confirmed
+handshake (not yet discovered, pending approval, or denied).
 
 ---
 
@@ -424,7 +446,7 @@ replay attacks and identity spoofing.
 ### 5.2 End-to-end encryption
 
 Direct messages to known agents are encrypted with X25519 ECDH + HKDF + AES-256-GCM
-(see §3.4).  The shared key is never transmitted; only the sender's ephemeral
+(see §3.2).  The shared key is never transmitted; only the sender's ephemeral
 public key (`epk`) is included so the recipient can reproduce it.
 
 GCM authentication tag protects against ciphertext tampering.
@@ -434,8 +456,8 @@ by design and visible to every subscriber of the content topic.
 
 ### 5.3 Quarantine
 
-Messages that fail the trust check (wrong/missing password, or unencrypted when
-auth is required) are written to isolated read-only files that are:
+Messages from a sender without a confirmed handshake (not yet approved by the
+local user) are written to isolated read-only files that are:
 
 - **Never inserted into the main database** — no SQL query path touches quarantine
   content after the initial write.
@@ -445,13 +467,7 @@ auth is required) are written to isolated read-only files that are:
 - **Viewable in the TUI** quarantine panel or via `hivesync quarantine` — for human
   inspection only.
 
-### 5.4 Auto-reply safety
-
-`BridgeManager` embeds `__auto: true` in automated reply messages.  On receive,
-this flag prevents the local agent from sending yet another auto-reply, breaking
-any potential reply loop between two agents that both have `autoReply` configured.
-
-### 5.5 Deduplication
+### 5.4 Deduplication
 
 A sliding window of 5000 seen message IDs (`seenIds` Set + `seenOrder` queue in
 `HiveSync`) prevents the same frame from being delivered twice even when Waku
@@ -472,7 +488,12 @@ Invoked as `hivesync <command> [options]`.  Built with `commander`.
 | `sync` | Trigger manual Obsidian sync and exit | — |
 | `sync-status` | Print per-agent sync counters and exit | — |
 | `agents` | Listen for 8 s and list discovered agents | — |
-| `quarantine` | List quarantined messages (read-only) | — |
+| `handshake <agentId>` | (Re-)initiate a handshake with an agent | — |
+| `contacts` | List confirmed contacts (agents with a completed handshake) | — |
+| `contact <agentId>` | Show handshake + capability details for one agent | — |
+| `approve <agentId>` | Approve a pending handshake request | — |
+| `deny <agentId>` | Deny a pending handshake request | — |
+| `quarantine` | List quarantined (untrusted) messages (read-only) | — |
 | `watch` | Informational; file watching starts with `start` | — |
 | `test` | Run connectivity, storage, FS, and crypto self-tests | — |
 
@@ -528,12 +549,6 @@ waku:
   contentTopic: /hivesync/1/agents/proto   # /{app}/{version}/{topic}/{encoding}
   keepAlive: true
   maxPeers: 10
-
-# Optional: require a matching password for trust
-auth:
-  salt: "<base64 random bytes>"
-  hash: "<base64 scrypt hash>"
-  autoReply: "✓ received"       # optional automated reply for trusted messages
 
 # Optional: Obsidian vault sync
 obsidian:
@@ -625,7 +640,6 @@ gateway:
 ```bash
 export HIVESYNC_HOME=/root/hivesync
 export HIVESYNC_AGENT_ID=everhomie
-export HIVESYNC_PASSWORD=<32-char random>
 export HIVESYNC_POLL_INTERVAL=15
 ```
 
@@ -635,15 +649,13 @@ Environment variables take precedence over `config.yaml` values.
 
 1. **Prerequisites** — checks `node ≥18`, `npm`, `git`, warns if `hermes` absent.
 2. **Build** — `npm install && npm run build` (idempotent).
-3. **Credentials** — generates or reuses a 32-char alphanumeric password; computes
-   `scrypt(password, randomSalt, 64)` and formats `salt:hash` (base64).
-4. **Config** — writes `config/hivesync.yaml` if it doesn't exist or the
+3. **Config** — writes `config/hivesync.yaml` if it doesn't exist or the
    `agentId` changed.
-5. **Plugin** — copies `adapter.py`, writes `__init__.py` and `plugin.yaml` to
+4. **Plugin** — copies `adapter.py`, writes `__init__.py` and `plugin.yaml` to
    `~/.hermes/plugins/hivesync-platform/`.
-6. **Hermes config** — upserts the `hivesync:` block under `gateway.platforms`
+5. **Hermes config** — upserts the `hivesync:` block under `gateway.platforms`
    in `~/.hermes/config.yaml`.
-7. **Env** — writes/updates four `HIVESYNC_*` vars in `~/.hermes/.env`.
+6. **Env** — writes/updates the `HIVESYNC_*` vars in `~/.hermes/.env`.
 
 ### 8.6 Authorization in the adapter
 
