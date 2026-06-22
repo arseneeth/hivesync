@@ -96,6 +96,13 @@ export class BridgeManager extends EventEmitter {
         throw new Error('Failed to initialize HiveSync bridge');
       }
 
+      // Restore previously confirmed handshakes from storage so trusted
+      // agents don't need to re-handshake after a daemon restart.
+      const trusted = await this.storage.getAllConfirmedHandshakes();
+      if (trusted.length > 0) {
+        this.hivesync.restoreTrustedAgents(trusted);
+      }
+
       // Obsidian real-time sync is strictly opt-in and never blocks messaging.
       const obsidian = this.config.obsidian;
       if (obsidian?.enabled && obsidian.vaultPath) {

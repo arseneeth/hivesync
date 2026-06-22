@@ -295,6 +295,26 @@ export class StorageManager {
     return rows.map((row: any) => this.rowToAgent(row));
   }
 
+  /** Load agents with a confirmed handshake (persists across restarts). */
+  async getAllConfirmedHandshakes(): Promise<Array<{
+    id: string; name: string; publicKey: string; encPublicKey?: string;
+    keyId?: string; handshakeStatus?: string; handshakeConfirmedAt?: string;
+  }>> {
+    const rows = await this.db.all(
+      `SELECT id, name, public_key, enc_public_key, key_id, handshake_status, handshake_confirmed_at
+       FROM agents WHERE handshake_status = 'confirmed'`
+    );
+    return rows.map((r: any) => ({
+      id: r.id,
+      name: r.name,
+      publicKey: r.public_key,
+      encPublicKey: r.enc_public_key || undefined,
+      keyId: r.key_id || undefined,
+      handshakeStatus: r.handshake_status,
+      handshakeConfirmedAt: r.handshake_confirmed_at,
+    }));
+  }
+
   async updateAgentLastSeen(agentId: string): Promise<void> {
     await this.db.run(
       `UPDATE agents SET last_seen = ? WHERE id = ?`,

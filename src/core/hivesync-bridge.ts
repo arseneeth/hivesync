@@ -144,6 +144,30 @@ export class HiveSync {
     }));
   }
 
+  /** Restore confirmed handshakes from persistent storage (survives restarts). */
+  restoreTrustedAgents(
+    agents: Array<{
+      id: string; name: string; publicKey: string; encPublicKey?: string;
+      keyId?: string; handshakeStatus?: string; handshakeConfirmedAt?: string;
+    }>,
+  ): void {
+    for (const a of agents) {
+      if (a.handshakeStatus === 'confirmed') {
+        this.knownAgents.set(a.id, {
+          agentId: a.id,
+          agentName: a.name,
+          signPublicKey: a.publicKey,
+          encPublicKey: a.encPublicKey || '',
+          keyId: a.keyId || '',
+          lastSeen: a.handshakeConfirmedAt ? new Date(a.handshakeConfirmedAt) : new Date(),
+          handshakeStatus: 'confirmed',
+          handshakeConfirmedAt: a.handshakeConfirmedAt ? new Date(a.handshakeConfirmedAt) : undefined,
+        });
+        logger.info(`Restored trusted handshake for ${a.id} (${a.name})`);
+      }
+    }
+  }
+
   async sendMessage(message: Omit<Message, 'id' | 'timestamp'>): Promise<string> {
     if (!this.isConnected) {
       throw new Error('HiveSync bridge not initialized or connected');
