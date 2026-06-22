@@ -76,7 +76,11 @@ export class WakuTransport implements Transport {
     const relayMod = await loadRelayMod();
     const utilsMod = await loadUtilsMod();
     const { waitForRemotePeer, Protocols } = sdk;
-    const { createRelayNode } = relayMod;
+    // createLibp2pAndUpdateOptions and WakuNode are exported at runtime but
+    // not in the .d.ts type definitions (ESM-only package). Cast to any.
+    const createLibp2pAndUpdateOptions = (sdk as any).createLibp2pAndUpdateOptions;
+    const WakuNode = (sdk as any).WakuNode;
+    const { Relay, wakuGossipSub } = relayMod;
     const { createRoutingInfo } = utilsMod;
 
     const networkConfig = {
@@ -92,22 +96,54 @@ export class WakuTransport implements Transport {
       contentTopic: this.config.contentTopic,
     });
 
-    // Use createRelayNode (full node with gossipsub) instead of createLightNode.
-    // Relay gives us a mesh network for both sending AND receiving,
-    // bypassing the broken LightPush/Filter peers on the testnet.
-    this.node = await createRelayNode({
+    // HYBRID NODE: Relay (gossipsub) for sending + Filter for receiving.
+    //
+    // createRelayNode() passes {} as protocolsEnabled, which defaults to
+    // { filter: false, lightpush: false, store: false }. This means a
+    // pure Relay node has NO Filter — it can only receive via gossipsub
+    // mesh. On the Waku testnet, gossipsub mesh forms (3 peers) but
+    // messages from light-node agents never reach the mesh because their
+    // LightPush sends are rejected by testnet peers.
+    //
+    // createLightNode() enables Filter but has NO Relay — it can't send
+    // via gossipsub, only via LightPush (which is broken on testnet).
+    //
+    // The solution: create a hybrid node manually. We replicate what
+    // createRelayNode does (set up gossipsub as pubsub service, create
+    // Relay object) BUT also pass { filter: true } to WakuNode so Filter
+    // is enabled. This gives us:
+    //   - Relay (gossipsub) for SENDING — broadcasts to mesh peers ✅
+    //   - Filter for RECEIVING — full-node peer pushes messages to us ✅
+    const nodeOptions: any = {
       defaultBootstrap: useDefaultBootstrap,
       bootstrapPeers: useDefaultBootstrap ? undefined : this.config.bootstrapNodes,
       networkConfig,
       routingInfos: [routingInfo],
-    } as any);
+      libp2p: {
+        services: {
+          pubsub: wakuGossipSub({
+            defaultBootstrap: useDefaultBootstrap,
+            bootstrapPeers: useDefaultBootstrap ? undefined : this.config.bootstrapNodes,
+            networkConfig,
+            routingInfos: [routingInfo],
+          } as any),
+        },
+      },
+    };
+
+    const libp2p = await createLibp2pAndUpdateOptions(nodeOptions);
+    const pubsubTopics = nodeOptions.routingInfos.map((ri: any) => ri.pubsubTopic);
+    const relay = new Relay({ pubsubTopics, libp2p } as any);
+
+    // KEY: pass { filter: true } — this is what createRelayNode does NOT do
+    this.node = new WakuNode(nodeOptions, libp2p, { filter: true }, relay);
 
     await this.node.start();
 
-    // Wait for Relay peers (gossipsub mesh). Also wait for Filter/LightPush
-    // as secondary, but don't block if only Relay peers are available.
-    await waitForRemotePeer(this.node, [Protocols.Relay], peerWaitTimeoutMs).catch(() => {
-      logger.warn('Timed out waiting for Relay peers — will continue anyway');
+    // Wait for Relay AND Filter peers. Relay for sending, Filter for receiving.
+    // Don't block forever if only one protocol's peers are available.
+    await waitForRemotePeer(this.node, [Protocols.Relay, Protocols.Filter], peerWaitTimeoutMs).catch(() => {
+      logger.warn('Timed out waiting for peers — will continue anyway');
     });
 
     // The node derives the pubsub topic/shard from its networkConfig + content topic.
@@ -129,8 +165,11 @@ export class WakuTransport implements Transport {
     if (this.node?.relay) {
       try {
         await this.node.relay.subscribeWithUnsubscribe([this.decoder], (msg: DecodedMessage) => {
-          if (msg.payload && this.handler) {
+          logger.info(`Relay callback fired: payload=${msg.payload?.length ?? 0} bytes`);
+          if (msg.payload && msg.payload.length > 0 && this.handler) {
             this.handler(msg.payload);
+          } else {
+            logger.warn(`Relay message has empty/null payload — skipping`);
           }
         });
         logger.info(`Relay subscribed to ${this.config.contentTopic}`);
@@ -139,11 +178,16 @@ export class WakuTransport implements Transport {
       }
     }
 
-    // Secondary: Filter subscribe (if available on light/relay hybrid nodes).
+    // Secondary: Filter subscribe — this is the primary RECEIVE path.
+    // Filter V2: a full-node peer on the testnet subscribes to the gossipsub
+    // mesh and pushes matching messages directly to us. This worked reliably
+    // before the refactor (when we used createLightNode) and is the reason
+    // messages were received. With our hybrid node, Filter is now enabled again.
     let filterPeers = 0;
     if (this.node?.filter) {
       try {
         const result = await this.node.filter.subscribe(this.decoder, (msg: DecodedMessage) => {
+          logger.info(`Filter callback fired: payload=${msg.payload?.length ?? 0} bytes`);
           if (msg.payload && this.handler) {
             this.handler(msg.payload);
           }
@@ -159,6 +203,8 @@ export class WakuTransport implements Transport {
           logger.warn('Waku filter subscribe: no peer accepted the subscription');
         } else if (successes > 0) {
           logger.info(`Filter subscribed to ${this.config.contentTopic} (${successes} peer(s))`);
+        } else {
+          logger.info(`Filter subscribe returned: successes=0, failures=0, error=${result.error ?? 'none'} — waiting for peers`);
         }
       } catch (err) {
         logger.warn(`Filter subscribe error: ${(err as Error).message}`);
