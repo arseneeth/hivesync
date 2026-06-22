@@ -13,8 +13,8 @@ const SIDEBAR_W = 30;
  *
  * Two persistent panes — a chat list on the left, the open conversation on the
  * right — with a coloured top bar (connection status), monogram "avatars",
- * left/right message bubbles, live search, and modal overlays for help and the
- * per-peer password prompt.
+ * left/right message bubbles, live search, and modal overlays for help and
+ * incoming handshake approval requests.
  *
  * Humans get this UI; agents get the same capabilities through the
  * event-driven {@link BridgeManager} API, so this view is purely additive.
@@ -41,7 +41,6 @@ export async function startTui(
   const lastMsg = new Map<string, string>(); // peer → last message preview
   let view: 'chat' | 'quarantine' | 'empty' = 'empty';
   let openPeer: string | null = null;
-  let pendingPeer: string | null = null;
   let filter = '';
   let rowToPeer: string[] = [];
   // Messages rendered in the currently-open chat, kept so we can redraw when a
@@ -236,37 +235,39 @@ export async function startTui(
     content: helpText(),
   });
 
-  const pwPrompt = blessed.box({
+  // Modal asking the user to approve/deny an incoming handshake request. A peer
+  // can't send us trusted messages until we approve their handshake here.
+  const approvalQueue: Array<{ agentId: string; agentName: string; capabilities: string[] }> = [];
+  const approval = blessed.box({
     parent: screen,
     top: 'center',
     left: 'center',
-    width: 60,
-    height: 8,
+    width: 64,
+    height: 11,
     border: { type: 'line' },
     tags: true,
-    label: ' 🔑 password ',
+    label: ' 🤝 handshake request ',
     hidden: true,
     style: { fg: 'white', bg: TG.panel, border: { fg: TG.blue } },
   });
-  const pwLabel = blessed.text({
-    parent: pwPrompt,
-    top: 0,
-    left: 1,
-    right: 1,
-    height: 3,
+  const approvalLabel = blessed.text({
+    parent: approval,
+    top: 1,
+    left: 2,
+    right: 2,
+    height: 5,
     tags: true,
     style: { bg: TG.panel },
   });
-  const pwInput = blessed.textbox({
-    parent: pwPrompt,
+  const approvalHint = blessed.text({
+    parent: approval,
     bottom: 1,
-    left: 1,
-    right: 1,
+    left: 2,
+    right: 2,
     height: 1,
-    inputOnFocus: true,
-    censor: true,
-    keys: true,
-    style: { fg: 'white', bg: TG.ink },
+    tags: true,
+    content: `{${TG.online}-fg}{bold}y{/bold} approve{/}   {#E17076-fg}{bold}n{/bold} deny{/}   {${TG.muted}-fg}Esc later{/}`,
+    style: { bg: TG.panel },
   });
 
   // ===================================================== rendering helpers
@@ -417,27 +418,39 @@ export async function startTui(
     const bg = me ? TG.imBlue : TG.imGreen;
     const pad0 = me ? ' '.repeat(Math.max(0, innerW - bubbleW)) : '';
 
+    // Pad every line out to the full inner width with trailing spaces. blessed's
+    // diff renderer only repaints the cells a line actually writes, so a short
+    // coloured bubble leaves the cells to its right "untouched" — on scroll or
+    // redraw those stale cells keep their old bubble background, which is the
+    // green/blue smear. Writing real spaces across the whole row forces every
+    // cell to be rewritten each render, so nothing bleeds.
+    const fill = (visibleWidth: number): string => ' '.repeat(Math.max(0, innerW - visibleWidth));
+
     if (showName && !me) {
       const nm = nameFor(m.sender);
-      chatLog.add(`${pad0}{${avatarColor(nm)}-fg}{bold}${escapeTags(nm)}{/bold}{/}`);
+      const shownName = escapeTags(nm).slice(0, contentW);
+      chatLog.add(
+        `${pad0}{${avatarColor(nm)}-fg}{bold}${shownName}{/bold}{/}${fill(pad0.length + shownName.length)}`
+      );
     }
 
     const bubbleLine = (s: string): string =>
-      `${pad0}{${bg}-bg}{white-fg} ${s.padEnd(contentW)} {/}`;
+      `${pad0}{${bg}-bg}{white-fg} ${s.padEnd(contentW)} {/}${fill(pad0.length + bubbleW)}`;
 
     for (const l of wrapped.length ? wrapped : ['']) chatLog.add(bubbleLine(l));
     // The meta line (time · ✓ · lock) sits on the coloured bubble, so use a
     // plain white fg — TG.muted grey is unreadable on both the green outgoing
     // and blue incoming backgrounds.
-    chatLog.add(`${pad0}{${bg}-bg}{white-fg} ${meta.padStart(contentW)} {/}`);
-    chatLog.add(''); // breathing room between bubbles
+    chatLog.add(`${pad0}{${bg}-bg}{white-fg} ${meta.padStart(contentW)} {/}${fill(pad0.length + bubbleW)}`);
+    chatLog.add(' '.repeat(innerW)); // breathing room between bubbles
   }
 
   function dayDivider(): void {
     const w = ((chatLog.width as number) || 50) - 4;
     const label = ' today ';
     const side = Math.max(0, Math.floor((w - label.length) / 2));
-    chatLog.add(`{${TG.muted}-fg}${'─'.repeat(side)}${label}${'─'.repeat(side)}{/}`);
+    const bar = `${'─'.repeat(side)}${label}${'─'.repeat(side)}`;
+    chatLog.add(`{${TG.muted}-fg}${bar}{/}${' '.repeat(Math.max(0, w - bar.length))}`);
   }
 
   // ===================================================== view switching
@@ -543,7 +556,6 @@ export async function startTui(
 
   // ===================================================== focus helpers
   function focusList(): void {
-    pwPrompt.hide();
     help.hide();
     chats.focus();
     setFooter(`{bold}↑↓{/bold} move · {bold}Enter{/bold} open · {bold}/{/bold} search · {bold}?{/bold} keys · {bold}q{/bold} quit`);
@@ -577,16 +589,42 @@ export async function startTui(
     screen.render();
   });
 
-  pwInput.on('submit', () => {
-    if (!pendingPeer) return;
-    const peer = pendingPeer;
-    pwInput.clearValue();
-    pwPrompt.hide();
-    void showChat(peer);
-  });
-  pwInput.key('escape', () => {
-    pwInput.clearValue();
-    pwPrompt.hide();
+  // --- handshake approval modal ------------------------------------------
+  function showNextApproval(): void {
+    const next = approvalQueue[0];
+    if (!next) {
+      approval.hide();
+      focusList();
+      return;
+    }
+    const caps = next.capabilities.length ? next.capabilities.join(', ') : 'none';
+    approvalLabel.setContent(
+      `{bold}${escapeTags(next.agentName)}{/bold} {${TG.muted}-fg}(${escapeTags(next.agentId)}){/}\n` +
+        `wants to start chatting with you.\n\n` +
+        `{${TG.muted}-fg}capabilities:{/} ${escapeTags(caps)}`
+    );
+    approval.show();
+    approval.setFront();
+    approval.focus();
+    screen.render();
+  }
+
+  function resolveApproval(approved: boolean): void {
+    const current = approvalQueue.shift();
+    if (current) {
+      const action = approved
+        ? bridge.approveHandshake(current.agentId)
+        : bridge.denyHandshake(current.agentId);
+      void action.catch(() => undefined);
+    }
+    showNextApproval();
+  }
+
+  approval.key(['y', 'Y'], () => resolveApproval(true));
+  approval.key(['n', 'N'], () => resolveApproval(false));
+  approval.key('escape', () => {
+    // Defer the decision — keep it queued so the CLI/`approve` can handle it.
+    approval.hide();
     focusList();
   });
 
@@ -696,6 +734,17 @@ export async function startTui(
     else refreshContacts();
   });
 
+  // A peer wants to handshake — ask the user to approve before they're trusted.
+  bridge.on(
+    'handshakeApprovalNeeded',
+    (info: { agentId: string; agentName: string; capabilities: string[] }) => {
+      if (approvalQueue.some((a) => a.agentId === info.agentId)) return;
+      approvalQueue.push(info);
+      if (!approval.hidden) return; // already showing one; this is queued
+      showNextApproval();
+    }
+  );
+
   // Global quit + periodic status refresh.
   screen.key(['C-c'], async () => quit());
   const statusTimer = setInterval(() => void refreshTopBar(), 5000);
@@ -714,6 +763,20 @@ export async function startTui(
   showEmptyState();
   focusList();
   screen.render();
+
+  // Surface any handshake requests that arrived before this view attached its
+  // listener (emitted once during bridge.start()).
+  void bridge
+    .getPendingApprovals()
+    .then((pending) => {
+      for (const p of pending) {
+        if (!approvalQueue.some((a) => a.agentId === p.agentId)) {
+          approvalQueue.push({ agentId: p.agentId, agentName: p.agentName, capabilities: p.capabilities });
+        }
+      }
+      if (approvalQueue.length && approval.hidden) showNextApproval();
+    })
+    .catch(() => undefined);
 
   // Resolve only when the process exits.
   return new Promise<void>(() => undefined);
@@ -763,9 +826,9 @@ function helpText(): string {
     '  Ctrl-X         select-and-copy mode (frees the mouse)',
     '',
     `{${TG.blueLight}-fg}Access control{/}`,
-    '  Opening an agent asks for {bold}their password{/bold} once per session.',
-    '  Right password → your messages are trusted & executed.',
-    '  Wrong/none → routed to {#E17076-fg}(!) Quarantine{/} on their side.',
+    '  New agents must complete a {bold}handshake{/bold} you approve.',
+    '  On a request: {bold}y{/bold} approve · {bold}n{/bold} deny.',
+    '  Until approved, their messages wait in {#E17076-fg}(!) Quarantine{/}.',
     '',
     `{${TG.muted}-fg}Press Esc to close.{/}`,
   ].join('\n');

@@ -97,7 +97,7 @@ export class StorageManager {
         agent_id TEXT NOT NULL,
         agent_name TEXT,
         capabilities TEXT,
-        status TEXT DEFAULT "pending",
+        status TEXT DEFAULT 'pending',
         created_at DATETIME,
         responded_at DATETIME
       )
@@ -511,12 +511,12 @@ export class StorageManager {
   private rowToApproval(row: any): HandshakeApproval {
     return {
       id: row.id,
-      agent_id: row.agent_id,
-      agent_name: row.agent_name ?? '',
+      agentId: row.agent_id,
+      agentName: row.agent_name ?? '',
       capabilities: parseCapabilities(row.capabilities),
-      status: row.status as "pending" | "approved" | "denied",
-      created_at: new Date(row.created_at),
-      responded_at: row.responded_at ? new Date(row.responded_at) : undefined,
+      status: row.status as 'pending' | 'approved' | 'denied',
+      createdAt: new Date(row.created_at),
+      respondedAt: row.responded_at ? new Date(row.responded_at) : undefined,
     };
   }
 

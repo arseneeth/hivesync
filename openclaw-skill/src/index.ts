@@ -1,6 +1,6 @@
 import { Skill, Context, Response } from 'openclaw-sdk';
-import { BridgeManager } from 'waku-bridge';
-import { loadConfig } from 'waku-bridge/dist/utils/config';
+import { BridgeManager } from 'hivesync';
+import { loadConfig } from 'hivesync/dist/utils/config';
 
 export class WakuBridgeSkill extends Skill {
   private bridge: BridgeManager | null = null;
@@ -49,13 +49,13 @@ export class WakuBridgeSkill extends Skill {
 
       // Check for specific commands
       if (text.includes('status') || text.includes('check')) {
-        const status = this.bridge.getStatus();
+        const status = await this.bridge.getStatus();
         return this.createResponse(
-          `Waku Bridge Status:
+          `HiveSync Status:
 • Agent: ${status.agentName} (${status.agentId})
-• Connected: ${status.waku.connected ? 'Yes' : 'No'}
-• Peers: ${status.waku.peers}
-• Obsidian Sync: ${status.obsidianSync ? 'Enabled' : 'Disabled'}`,
+• Connected: ${status.hivesync.connected ? 'Yes' : 'No'}
+• Peers: ${status.hivesync.peers}
+• Obsidian Sync: ${status.realTimeSync ? 'Enabled' : 'Disabled'}`,
           true
         );
       }
@@ -120,7 +120,7 @@ export class WakuBridgeSkill extends Skill {
 
     } catch (error) {
       this.logger.error('Error handling request:', error);
-      return this.createResponse(`Error: ${error.message}`, false);
+      return this.createResponse(`Error: ${(error as Error).message}`, false);
     }
   }
 

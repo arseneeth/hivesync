@@ -5,7 +5,7 @@
 # Usage:
 #   bash openclaw-setup.sh [agent-name]
 #
-# Idempotent: safe to re-run; reuses existing password and skips unchanged steps.
+# Idempotent: safe to re-run; skips unchanged steps.
 # =============================================================================
 
 set -euo pipefail
@@ -64,38 +64,6 @@ info "npm run build..."
 npm run build 2>/dev/null
 ok "Build complete — dist/cli.js ready"
 
-# ── 4. Generate password ──────────────────────────────────────────────────────
-header "Generating credentials"
-
-PASSWORD_FILE="${REPO_DIR}/.password"
-
-if [[ -f "$PASSWORD_FILE" ]]; then
-  PASSWORD=$(cat "$PASSWORD_FILE")
-  info "Reusing existing password from ${PASSWORD_FILE}"
-else
-  PASSWORD=$(node -e "
-    const c = require('crypto');
-    let s = '';
-    while (s.length < 32) s += c.randomBytes(32).toString('base64').replace(/[^a-zA-Z0-9]/g, '');
-    process.stdout.write(s.slice(0, 32));
-  ")
-  echo -n "$PASSWORD" > "$PASSWORD_FILE"
-  chmod 600 "$PASSWORD_FILE"
-  info "Generated new 32-char password"
-fi
-
-# Compute scrypt hash (matching HiveSync's crypto.ts: scryptSync, salt=16, hash=32)
-SCRYPT_SALT=$(node -e "
-  const c = require('crypto');
-  process.stdout.write(c.randomBytes(16).toString('base64'));
-")
-SCRYPT_HASH=$(node -e "
-  const c = require('crypto');
-  const p = Buffer.from('${PASSWORD}', 'utf-8');
-  const s = Buffer.from('${SCRYPT_SALT}', 'base64');
-  process.stdout.write(c.scryptSync(p, s, 32).toString('base64'));
-")
-
 # ── 5. Write HiveSync daemon config ──────────────────────────────────────────
 header "Writing HiveSync daemon config"
 
@@ -127,11 +95,6 @@ waku:
   contentTopic: /hivesync/1/agents/proto
   keepAlive: true
   maxPeers: 10
-
-auth:
-  salt: "${SCRYPT_SALT}"
-  hash: "${SCRYPT_HASH}"
-  autoReply: "✓ received"
 
 obsidian:
   enabled: false
@@ -256,7 +219,6 @@ Environment=NODE_ENV=production
 Environment=TELEGRAM_CHAT_ID=738354370
 Environment=MY_AGENT_ID=${AGENT_ID}
 Environment=POLL_INTERVAL_MS=5000
-Environment=AUTO_REPLY=✓ received
 StandardOutput=journal
 StandardError=journal
 
@@ -279,10 +241,15 @@ echo -e "${BOLD}${GREEN}  HiveSync + OpenClaw setup complete!${NC}"
 echo -e "${BOLD}${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 echo -e "  ${BOLD}Agent ID :${NC}  ${AGENT_ID}"
-echo -e "  ${BOLD}Password :${NC}  ${PASSWORD}"
 echo -e "  ${BOLD}Config   :${NC}  ${CONFIG_FILE}"
 echo ""
-echo -e "  ${YELLOW}Share the password above with agents you want to allow to message you.${NC}"
+echo -e "  ${CYAN}Trust model (handshake approval):${NC}"
+echo -e "    When another agent first messages you, approve them with:"
+echo -e "      node dist/cli.js approve <their-agent-id>"
+echo -e "    Reject with:"
+echo -e "      node dist/cli.js deny <their-agent-id>"
+echo -e "    Until approved, their messages are held in quarantine:"
+echo -e "      node dist/cli.js quarantine"
 echo ""
 echo -e "  ${CYAN}Start the daemon:${NC}"
 echo -e "    systemctl --user start hivesync.service"

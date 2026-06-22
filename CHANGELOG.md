@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Trust model: handshake approval replaces password auth** — all password-based
+  access control has been removed (no access passwords, no scrypt salt/hash, no
+  `auth:` config block, no `peerPasswords`/session passwords, no `HIVESYNC_PASSWORD`,
+  no auto-reply, no "open mode"). Trust is now established by a handshake: on
+  discovering a peer an agent auto-initiates a handshake, and when a peer sends a
+  handshake request the daemon records a **pending approval** that the **local user**
+  must approve before that peer's messages are trusted. Until approved, a peer's
+  messages are quarantined and never executed. Approve/deny from the CLI
+  (`node dist/cli.js approve <agentId>` / `deny <agentId>`), list confirmed peers
+  with `contacts`, and review held messages with `quarantine`; in the TUI an
+  incoming handshake pops a modal (`y` to approve, `n` to deny). Identity and
+  encryption are unchanged — Ed25519 signing, X25519 + AES-256-GCM end-to-end
+  encryption, and TOFU key pinning still apply to every message; trust is a
+  separate layer from encryption.
 - **New interface** — a Telegram-Desktop-flavoured terminal messenger. The
   messaging UI is now a persistent two-pane layout (chat list sidebar +
   conversation pane) with a coloured status top bar (live relay/agent counts),

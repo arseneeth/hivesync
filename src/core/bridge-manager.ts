@@ -5,7 +5,6 @@ import { EventEmitter } from 'events';
 import { HiveSync } from './hivesync-bridge';
 import { Identity } from './identity';
 import { Transport } from './transport';
-import { verifyPassword } from './crypto';
 import { StorageManager } from '../storage/storage-manager';
 import { QuarantineStore } from '../storage/quarantine-store';
 import { RealTimeSyncManager } from '../sync/real-time-sync';
@@ -13,12 +12,11 @@ import { BridgeConfig, AgentIdentity, Message, MessageType, QuarantinedMessage, 
 import { HandshakeInfo } from './hivesync-bridge';
 import { logger } from '../utils/logger';
 
-// Meta field carried inside message content, stripped before the message is
-// stored or handed to consumers.
-const AUTO_FIELD = '__auto';
-
 // How often the outbox poller checks the DB for messages to push over Waku.
 const OUTBOX_POLL_INTERVAL_MS = 2000;
+
+// How often we poll the DB for handshake approvals recorded by the CLI/UI.
+const APPROVAL_POLL_INTERVAL_MS = 3000;
 
 /**
  * Orchestrates identity, transport, storage and (optional) sync, and enforces
@@ -29,9 +27,9 @@ const OUTBOX_POLL_INTERVAL_MS = 2000;
  *  - `quarantine`      (message: QuarantinedMessage) an untrusted message held aside
  *  - `agentDiscovered` (agent: AgentIdentity)    a newly discovered peer
  *
- * Trust: without legacy auth config, a message is trusted only when the sender
- * has a confirmed handshake (status='confirmed'). Untrusted messages are
- * quarantined and never executed. Handshake_init/ack always bypass this check.
+ * Trust: a message is trusted only when the sender has a confirmed handshake
+ * (status='confirmed'). Untrusted messages are quarantined and never executed.
+ * Handshake_init/ack always bypass this check.
  */
 export class BridgeManager extends EventEmitter {
   private readonly config: BridgeConfig;
@@ -65,11 +63,6 @@ export class BridgeManager extends EventEmitter {
         ? path.join(os.tmpdir(), `hivesync-quarantine-${sanitize(config.agentId)}-${process.pid}`)
         : path.join(path.dirname(config.storagePath), 'quarantine');
     this.quarantine = new QuarantineStore(quarantineDir);
-  }
-
-  /** True if access control is active (a password has been configured). */
-  get authEnabled(): boolean {
-    return !!this.config.auth?.hash;
   }
 
   async start(peerWaitTimeoutMs = 30000): Promise<boolean> {
@@ -134,27 +127,30 @@ export class BridgeManager extends EventEmitter {
         this.emit('handshakeApprovalNeeded', { agentId, agentName, capabilities });
       });
 
-      // Poll every 3s for approvals written to DB (e.g. by CLI approve command).
-      this.approvalTimer = setInterval(async () => {
-        try {
-          const approved = await this.storage.getRecentlyApproved();
-          for (const approval of approved) {
-            await this.hivesync.completeHandshakeApproval(approval.agent_id).catch((e) =>
-              logger.debug('Failed to complete handshake approval:', e)
-            );
-          }
-        } catch (e) {
-          logger.debug('Approval poll error:', e);
-        }
-      }, 3000);
+      // Poll for approvals recorded in the DB (e.g. by the CLI `approve`
+      // command in a separate process) and complete the handshake for each.
+      this.approvalTimer = setInterval(() => {
+        void this.storage
+          .getRecentlyApproved()
+          .then((approved) =>
+            Promise.all(
+              approved.map((approval) =>
+                this.hivesync
+                  .completeHandshakeApproval(approval.agentId)
+                  .catch((e) => logger.debug('Failed to complete handshake approval:', e))
+              )
+            )
+          )
+          .catch((e) => logger.debug('Approval poll error:', e));
+      }, APPROVAL_POLL_INTERVAL_MS);
       this.approvalTimer.unref?.();
 
       // Re-emit pending approvals from a prior run so handlers can surface them.
       const pendingOnStart = await this.storage.getPendingApprovals();
       for (const approval of pendingOnStart) {
         this.emit('handshakeApprovalNeeded', {
-          agentId: approval.agent_id,
-          agentName: approval.agent_name,
+          agentId: approval.agentId,
+          agentName: approval.agentName,
           capabilities: approval.capabilities,
         });
       }
@@ -211,14 +207,11 @@ export class BridgeManager extends EventEmitter {
         }
 
         try {
-          // Build the wire content with just the text (no password)
-          const wire: any = { text };
-
           await this.hivesync.sendMessage({
             sender: this.config.agentId,
             recipient: message.recipient,
             type: message.type,
-            content: wire,
+            content: { text },
             encrypted: message.recipient !== 'broadcast',
           });
           await this.storage.markDelivered(message.id);
@@ -250,23 +243,19 @@ export class BridgeManager extends EventEmitter {
 
   private setupMessageHandlers(): void {
     this.hivesync.onMessage(MessageType.TEXT, async (message) => {
-      const { trusted, content, isAuto } = this.classify(message);
-      const msg: Message = { ...message, content };
+      const trusted = this.isTrusted(message);
       if (!trusted) {
-        await this.quarantineMessage(msg);
+        await this.quarantineMessage(message);
         return;
       }
-      await this.storage.saveMessage(msg);
-      this.emit('text', msg);
-      this.emit('message', msg);
-      if (!isAuto && this.config.auth?.autoReply) {
-        void this.sendText(msg.sender, this.config.auth.autoReply, { auto: true }).catch(() => undefined);
-      }
+      await this.storage.saveMessage(message);
+      this.emit('text', message);
+      this.emit('message', message);
     });
 
     this.hivesync.onMessage(MessageType.COMMAND, async (message) => {
-      const { trusted, content } = this.classify(message);
-      const msg: Message = { ...message, content };
+      const trusted = this.isTrusted(message);
+      const msg: Message = message;
       if (!trusted) {
         await this.quarantineMessage(msg);
         return;
@@ -285,38 +274,16 @@ export class BridgeManager extends EventEmitter {
   }
 
   /**
-   * Decide whether an inbound message is trusted. With no legacy auth
-   * configured, trust is based on handshake status — only confirmed-handshake
-   * peers are trusted. Strips the auto-reply marker from content.
+   * Decide whether an inbound message is trusted. Trust is based purely on
+   * handshake status: only peers whose handshake we have confirmed are trusted.
+   * Everyone else (including not-yet-handshaked peers) is quarantined.
    */
-  private classify(message: Message): { trusted: boolean; content: any; isAuto: boolean } {
-    const content = { ...(message.content ?? {}) };
-    const isAuto = content[AUTO_FIELD] === true;
-    delete content[AUTO_FIELD];
-
-    let trusted: boolean;
-    if (!this.config.auth?.hash) {
-      // No password — trust only confirmed-handshake peers
-      const hs = this.hivesync.getHandshakeStatus(message.sender);
-      trusted = hs?.status === 'confirmed';
-    } else {
-      // Legacy password mode (backward compat)
-      const auth = typeof content['__auth'] === 'string' ? (content['__auth'] as string) : undefined;
-      delete (content as any)['__auth'];
-      trusted =
-        message.encrypted === true &&
-        !!auth &&
-        verifyPassword(auth, { salt: this.config.auth.salt, hash: this.config.auth.hash });
-    }
-    return { trusted, content, isAuto };
+  private isTrusted(message: Message): boolean {
+    return this.hivesync.getHandshakeStatus(message.sender)?.status === 'confirmed';
   }
 
   private async quarantineMessage(message: Message): Promise<void> {
-    const reason = this.config.auth?.hash
-      ? message.encrypted
-        ? 'missing or invalid password'
-        : 'unauthenticated (not encrypted)'
-      : 'untrusted (handshake not confirmed)';
+    const reason = 'untrusted (handshake not confirmed)';
     const file = await this.quarantine.add(message, reason);
     logger.warn(`Quarantined message from ${message.sender} (${reason}) -> ${file}`);
     this.emit('quarantine', { ...message, reason, file } as unknown as QuarantinedMessage);
@@ -357,27 +324,13 @@ export class BridgeManager extends EventEmitter {
   }
 
   async sendTextMessage(recipient: string, text: string): Promise<string> {
-    return this.sendText(recipient, text, {});
-  }
-
-  /**
-   * Internal text send. `auto` tags an automated reply so it can't re-trigger
-   * another automated reply.
-   */
-  private async sendText(
-    recipient: string,
-    text: string,
-    opts: { auto?: boolean }
-  ): Promise<string> {
     const willEncrypt = recipient !== 'broadcast' && this.isAgentKnown(recipient);
-    const wire: any = { text };
-    if (opts.auto) wire[AUTO_FIELD] = true;
 
     const id = await this.hivesync.sendMessage({
       sender: this.config.agentId,
       recipient,
       type: MessageType.TEXT,
-      content: wire,
+      content: { text },
       encrypted: recipient !== 'broadcast',
     });
     // Record our own outgoing message (clean content) so history is complete.
@@ -538,7 +491,6 @@ export class BridgeManager extends EventEmitter {
       agentId: this.config.agentId,
       agentName: this.config.agentName,
       keyId: this.identity.keyId,
-      authEnabled: this.authEnabled,
       quarantined: await this.getQuarantineCount(),
       hivesync,
       realTimeSync: !!this.realTimeSync,

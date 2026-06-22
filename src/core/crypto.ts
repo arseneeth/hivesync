@@ -104,29 +104,3 @@ export function decrypt(myEncPrivB64: string, payload: EncryptedPayload): Buffer
     decipher.final(),
   ]);
 }
-
-export interface PasswordHash {
-  salt: string;
-  hash: string;
-}
-
-/**
- * Hash an access password with scrypt. Only the salt + derived hash are stored
- * on disk — the password itself is never persisted and can't be recovered.
- */
-export function hashPassword(password: string): PasswordHash {
-  const salt = crypto.randomBytes(16);
-  const hash = crypto.scryptSync(password, salt, 32);
-  return { salt: salt.toString('base64'), hash: hash.toString('base64') };
-}
-
-/** Constant-time verification of a password against a stored salt+hash. */
-export function verifyPassword(password: string, stored: PasswordHash): boolean {
-  try {
-    const expected = Buffer.from(stored.hash, 'base64');
-    const actual = crypto.scryptSync(password, Buffer.from(stored.salt, 'base64'), expected.length);
-    return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
-  } catch {
-    return false;
-  }
-}

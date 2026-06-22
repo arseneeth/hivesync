@@ -58,6 +58,17 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
+  // The two e2e agents are mutually consenting, so each approves the other's
+  // auto-initiated handshake (a human would do this in the TUI/CLI). Until the
+  // handshake is confirmed, the peer's messages would be quarantined.
+  let approved = false;
+  const approveDeadline = Date.now() + 30000;
+  while (!approved && Date.now() < approveDeadline) {
+    approved = await bridge.approveHandshake(peerAgentId);
+    if (!approved) await new Promise((r) => setTimeout(r, 1000));
+  }
+  emit('approved', { peer: peerAgentId, ok: approved });
+
   // Keep resending until we observe the peer's message — one delivery only needs
   // to survive the public fleet's intermittent LightPush rejections.
   let received = false;

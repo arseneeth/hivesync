@@ -59,14 +59,15 @@ export interface HandshakeAckPayload {
   reason?: string; // "pending_approval" when user approval is needed
 }
 
+/** A handshake request awaiting (or having received) the local user's decision. */
 export interface HandshakeApproval {
   id: string;
-  agent_id: string;
-  agent_name: string;
+  agentId: string;
+  agentName: string;
   capabilities: string[];
-  status: "pending" | "approved" | "denied";
-  created_at: Date;
-  responded_at?: Date;
+  status: 'pending' | 'approved' | 'denied';
+  createdAt: Date;
+  respondedAt?: Date;
 }
 
 /** A peer with a completed (or in-progress) handshake. */
@@ -156,30 +157,12 @@ export interface ObsidianConfig {
   enabled: boolean;
 }
 
-/**
- * Access control. A peer must include this password (inside the E2E-encrypted
- * message) for its message to be *trusted* — i.e. processed/executed and
- * auto-replied. Only the scrypt salt+hash are stored; the password is never
- * persisted. If `auth` is absent the agent runs in open mode (all messages
- * trusted) for backward compatibility.
- */
-export interface AuthConfig {
-  /** scrypt salt (base64). */
-  salt: string;
-  /** scrypt hash of the password (base64). */
-  hash: string;
-  /** Optional automated reply sent when a trusted message arrives. */
-  autoReply?: string;
-}
-
 export interface BridgeConfig {
   agentId: string;
   agentName: string;
   storagePath: string;
   syncInterval: number;
   waku: WakuConfig;
-  auth?: AuthConfig;
-  peerPasswords?: Record<string, string>;  // per-peer passwords for outbound auth
   obsidian?: ObsidianConfig;
 }
 
