@@ -2,6 +2,7 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
 import * as fs from 'fs';
+import * as path from 'path';
 import * as crypto from 'crypto';
 import sqlite3 from 'sqlite3';
 import { BridgeManager } from './core/bridge-manager';
@@ -113,6 +114,7 @@ program
   .option('-c, --config <path>', 'Configuration file path', './config/hivesync.yaml')
   .option('--port <port>', 'TCP port to listen on (ws)', '16000')
   .option('--host <host>', 'Public host/IP spokes should dial (for the printed directPeers line)')
+  .option('--key <path>', 'Path to persist the hub peer key (stable peerId across restarts)')
   .option('--tls-cert <path>', 'TLS certificate (PEM) to listen over wss instead of ws')
   .option('--tls-key <path>', 'TLS private key (PEM) for wss')
   .action(async (options) => {
@@ -124,6 +126,10 @@ program
       config.waku.mode = 'relay';
       config.waku.directPeers = [];
       config.waku.listenAddresses = [`/ip4/0.0.0.0/tcp/${options.port}/${scheme}`];
+      // Persist the peer key by default so the hub's peerId — and therefore the
+      // directPeers line spokes use — stays stable across restarts.
+      config.waku.peerKeyPath =
+        options.key || path.join(path.dirname(config.storagePath), 'hub-peer.key');
       if (wss) {
         config.waku.tls = { certPath: options.tlsCert, keyPath: options.tlsKey };
       }

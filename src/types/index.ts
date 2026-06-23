@@ -173,6 +173,12 @@ export interface WakuConfig {
    */
   tls?: { certPath: string; keyPath: string };
   /**
+   * Path to persist this node's libp2p private key. When set, the peerId stays
+   * STABLE across restarts (the key is generated once and reloaded), so a relay
+   * hub's multiaddr doesn't change and spoke configs never need updating.
+   */
+  peerKeyPath?: string;
+  /**
    * How many LightPush service nodes to send each message to in parallel.
    * The SDK default is 1, which fails entirely if that one peer can't relay
    * (status 505 NO_PEERS) or its stream is reset. Defaults to 3 here. Raise it

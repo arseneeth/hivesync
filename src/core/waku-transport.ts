@@ -65,6 +65,33 @@ function loadWebSocketFilters(): Promise<any> {
   }
   return wsFilterPromise;
 }
+let cryptoKeysPromise: Promise<any> | null = null;
+function loadCryptoKeys(): Promise<any> {
+  if (!cryptoKeysPromise) {
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval
+    cryptoKeysPromise = new Function('return import("@libp2p/crypto/keys")')() as Promise<any>;
+  }
+  return cryptoKeysPromise;
+}
+
+/**
+ * Load a persisted libp2p private key from `path`, or generate one and save it
+ * (0600). Returns undefined if no path is configured. A stable key means a
+ * stable peerId across restarts — essential for a relay hub whose multiaddr is
+ * baked into spoke configs.
+ */
+async function loadOrCreatePeerKey(path?: string): Promise<any | undefined> {
+  if (!path) return undefined;
+  const fs = await import('fs');
+  const keys = await loadCryptoKeys();
+  if (fs.existsSync(path)) {
+    return keys.privateKeyFromProtobuf(new Uint8Array(fs.readFileSync(path)));
+  }
+  const key = await keys.generateKeyPair('Ed25519');
+  fs.writeFileSync(path, Buffer.from(keys.privateKeyToProtobuf(key)), { mode: 0o600 });
+  logger.info(`Generated persistent peer key at ${path} (peerId is now stable across restarts)`);
+  return key;
+}
 
 export type RawMessageHandler = (payload: Uint8Array) => void;
 
@@ -166,6 +193,10 @@ export class WakuTransport implements Transport {
       filterMultiaddrs: false,
     };
 
+    // Stable peerId across restarts (so the hub's multiaddr never changes).
+    const peerKey = await loadOrCreatePeerKey(this.config.peerKeyPath);
+    if (peerKey) libp2p.privateKey = peerKey;
+
     // WSS: to listen on a `/tls/ws` address we must hand the websockets
     // transport an https server (cert + key). Override the SDK's default
     // transport with one configured for TLS.
@@ -263,11 +294,13 @@ export class WakuTransport implements Transport {
     // "LightPush delivered to 0 peers" on the public fleet.
     // numPeersToUse is honored at runtime (WakuNode -> PeerManager) but is not
     // in the SDK's CreateNodeOptions d.ts, hence the cast.
+    const peerKey = await loadOrCreatePeerKey(this.config.peerKeyPath);
     this.node = await createLightNode({
       defaultBootstrap: useDefaultBootstrap,
       bootstrapPeers: useDefaultBootstrap ? undefined : this.config.bootstrapNodes,
       networkConfig,
       numPeersToUse: this.config.lightPushPeers ?? 3,
+      ...(peerKey ? { libp2p: { privateKey: peerKey } } : {}),
     } as any);
 
     await this.node.start();
