@@ -14,48 +14,40 @@ type DecodedMessage = { payload?: Uint8Array };
  * dynamic `import()`, which works from CJS, and cache the module.
  */
 type WakuSdk = typeof import('@waku/sdk');
-type WakuRelayMod = typeof import('@waku/relay');
-type WakuUtilsMod = typeof import('@waku/utils');
 let sdkPromise: Promise<WakuSdk> | null = null;
-let relayModPromise: Promise<WakuRelayMod> | null = null;
-let utilsModPromise: Promise<WakuUtilsMod> | null = null;
-
 function loadSdk(): Promise<WakuSdk> {
   if (!sdkPromise) {
-    sdkPromise = (new Function('return import("@waku/sdk")')() as Promise<WakuSdk>);
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval
+    sdkPromise = new Function('return import("@waku/sdk")')() as Promise<WakuSdk>;
   }
   return sdkPromise;
-}
-
-function loadRelayMod(): Promise<WakuRelayMod> {
-  if (!relayModPromise) {
-    relayModPromise = (new Function('return import("@waku/relay")')() as Promise<WakuRelayMod>);
-  }
-  return relayModPromise;
-}
-
-function loadUtilsMod(): Promise<WakuUtilsMod> {
-  if (!utilsModPromise) {
-    utilsModPromise = (new Function('return import("@waku/utils")')() as Promise<WakuUtilsMod>);
-  }
-  return utilsModPromise;
-}
-
-/** Dynamic import for multiaddr (ESM-only, loaded at runtime). */
-let maMod: any = null;
-async function loadMultiaddr(): Promise<any> {
-  if (!maMod) {
-    maMod = await new Function('return import("@multiformats/multiaddr")')();
-  }
-  return maMod;
 }
 
 export type RawMessageHandler = (payload: Uint8Array) => void;
 
 /**
- * Thin wrapper over a Waku light node: connect, publish bytes to the configured
- * content topic, and subscribe to receive bytes. All HiveSync-level concerns
- * (framing, identity, encryption, routing) live above this layer.
+ * Thin wrapper over a Waku **light node**: connect, publish bytes to the
+ * configured content topic, and subscribe to receive bytes.
+ *
+ * WHY A LIGHT NODE (and not a Relay node):
+ * HiveSync agents run on VPSs behind NAT / cloud proxies and are NOT reachable
+ * from the outside. A Relay node has to graft itself into the GossipSub mesh,
+ * which (a) needs inbound reachability to be useful and (b) fragments into
+ * disjoint meshes when only 2-3 of our own nodes are involved. That is the
+ * "messages never arrive" failure we hit.
+ *
+ * A light node instead dials *out* to the public Waku Network's service nodes
+ * and uses request/response protocols over those outbound streams:
+ *   - LightPush (send): a service node publishes our message into the mesh.
+ *   - Filter   (recv): a service node pushes matching messages back to us.
+ *   - Store    (recv): poll a service node for anything Filter missed.
+ * All three work through outbound connections, so NAT is a non-issue and the
+ * well-connected fleet provides the mesh backbone. This is the model Waku
+ * designed for resource-restricted / non-reachable nodes, and the one the
+ * original HiveSync prototype used successfully.
+ *
+ * All HiveSync-level concerns (framing, identity, encryption, routing) live
+ * above this layer.
  */
 export class WakuTransport implements Transport {
   private node: WakuNodeLike | null = null;
@@ -65,6 +57,7 @@ export class WakuTransport implements Transport {
   private handler: RawMessageHandler | null = null;
   private started = false;
   private storePollTimer: NodeJS.Timeout | null = null;
+  private filterHealthTimer: NodeJS.Timeout | null = null;
   private lastStoreQueryTime: Date | null = null;
   private storePolling = false;
 
@@ -82,238 +75,155 @@ export class WakuTransport implements Transport {
 
   async start(peerWaitTimeoutMs = 30000): Promise<void> {
     const sdk = await loadSdk();
-    const relayMod = await loadRelayMod();
-    const utilsMod = await loadUtilsMod();
-    const { waitForRemotePeer, Protocols } = sdk;
-    // createLibp2pAndUpdateOptions and WakuNode are exported at runtime but
-    // not in the .d.ts type definitions (ESM-only package). Cast to any.
-    const createLibp2pAndUpdateOptions = (sdk as any).createLibp2pAndUpdateOptions;
-    const WakuNode = (sdk as any).WakuNode;
-    const { Relay, wakuGossipSub } = relayMod;
-    const { createRoutingInfo } = utilsMod;
+    const { createLightNode, waitForRemotePeer, Protocols } = sdk;
 
     const networkConfig = {
       clusterId: this.config.clusterId,
       numShardsInCluster: this.config.numShardsInCluster,
     };
 
-    const useDefaultBootstrap = !this.config.bootstrapNodes || this.config.bootstrapNodes.length === 0;
+    const useDefaultBootstrap =
+      !this.config.bootstrapNodes || this.config.bootstrapNodes.length === 0;
 
-    // Build routing info from network config + content topic.
-    // This determines the pubsub topic (shard) our node subscribes to.
-    const routingInfo = createRoutingInfo(networkConfig as any, {
-      contentTopic: this.config.contentTopic,
-    });
-
-    // HYBRID NODE: Relay (gossipsub) for sending + Filter for receiving.
-    //
-    // createRelayNode() passes {} as protocolsEnabled, which defaults to
-    // { filter: false, lightpush: false, store: false }. This means a
-    // pure Relay node has NO Filter — it can only receive via gossipsub
-    // mesh. On the Waku testnet, gossipsub mesh forms (3 peers) but
-    // messages from light-node agents never reach the mesh because their
-    // LightPush sends are rejected by testnet peers.
-    //
-    // createLightNode() enables Filter but has NO Relay — it can't send
-    // via gossipsub, only via LightPush (which is broken on testnet).
-    //
-    // The solution: create a hybrid node manually. We replicate what
-    // createRelayNode does (set up gossipsub as pubsub service, create
-    // Relay object) BUT also pass { filter: true } to WakuNode so Filter
-    // is enabled. This gives us:
-    //   - Relay (gossipsub) for SENDING — broadcasts to mesh peers ✅
-    //   - Filter for RECEIVING — full-node peer pushes messages to us ✅
-    const nodeOptions: any = {
+    // A light node connects OUT to the public fleet; it does not need to listen
+    // for inbound dials. defaultBootstrap discovers The Waku Network service
+    // nodes via DNS discovery + the static bootstrap list.
+    this.node = await createLightNode({
       defaultBootstrap: useDefaultBootstrap,
       bootstrapPeers: useDefaultBootstrap ? undefined : this.config.bootstrapNodes,
       networkConfig,
-      routingInfos: [routingInfo],
-      libp2p: {
-        addresses: {
-          listen: this.config.listenAddresses,
-        },
-        filterMultiaddrs: false,
-        services: {
-          pubsub: wakuGossipSub({
-            defaultBootstrap: useDefaultBootstrap,
-            bootstrapPeers: useDefaultBootstrap ? undefined : this.config.bootstrapNodes,
-            networkConfig,
-            routingInfos: [routingInfo],
-          } as any),
-        },
-      },
-    };
-
-    const libp2p = await createLibp2pAndUpdateOptions(nodeOptions);
-    const pubsubTopics = nodeOptions.routingInfos.map((ri: any) => ri.pubsubTopic);
-    const relay = new Relay({ pubsubTopics, libp2p } as any);
-
-    // KEY: pass { filter: true } — this is what createRelayNode does NOT do
-    this.node = new WakuNode(nodeOptions, libp2p, { filter: true }, relay);
+    });
 
     await this.node.start();
 
-    // Wait for Relay AND Filter peers. Relay for sending, Filter for receiving.
-    // Don't block forever if only one protocol's peers are available.
-    await waitForRemotePeer(this.node, [Protocols.Relay, Protocols.Filter], peerWaitTimeoutMs).catch(() => {
-      logger.warn('Timed out waiting for peers — will continue anyway');
+    // Wait for peers that speak the protocols we actually use. We don't hard
+    // fail if only some are available — a partial set (e.g. Filter but not yet
+    // LightPush) is still useful, and the bridge resends until delivery.
+    await waitForRemotePeer(
+      this.node,
+      [Protocols.LightPush, Protocols.Filter, Protocols.Store],
+      peerWaitTimeoutMs
+    ).catch(() => {
+      logger.warn('Timed out waiting for Waku peers — continuing, will retry on use');
     });
-
-    // Connect to any configured direct peers.
-    if (this.config.directPeers && this.config.directPeers.length > 0) {
-      const maMod = await loadMultiaddr();
-      for (const peerAddr of this.config.directPeers) {
-        try {
-          logger.info(`Dialing direct peer: ${peerAddr}`);
-          await this.node.libp2p.dial(maMod.multiaddr(peerAddr));
-          logger.info(`Connected to direct peer: ${peerAddr}`);
-        } catch (err) {
-          logger.warn(`Failed to dial direct peer ${peerAddr}: ${(err as Error).message}`);
-        }
-      }
-    }
 
     // The node derives the pubsub topic/shard from its networkConfig + content topic.
     this.encoder = this.node.createEncoder({ contentTopic: this.config.contentTopic });
     this.decoder = this.node.createDecoder({ contentTopic: this.config.contentTopic });
 
     this.started = true;
-    logger.info(`Waku transport connected (peerId ${this.node.peerId.toString()})`);
-    logger.info(`Relay enabled: ${!!this.node.relay}, Filter: ${!!this.node.filter}, LightPush: ${!!this.node.lightPush}, Store: ${!!this.node.store}`);
+    logger.info(`Waku light node connected (peerId ${this.node.peerId.toString()})`);
+    logger.info(
+      `Protocols — LightPush: ${!!this.node.lightPush}, Filter: ${!!this.node.filter}, Store: ${!!this.node.store}`
+    );
   }
 
   async subscribe(handler: RawMessageHandler): Promise<void> {
-    if (!this.decoder) {
+    if (!this.node?.filter || !this.decoder) {
       throw new Error('Waku transport not started');
     }
     this.handler = handler;
 
-    // Primary: Relay (gossipsub) subscribe — most reliable on the testnet.
-    if (this.node?.relay) {
-      try {
-        await this.node.relay.subscribeWithUnsubscribe([this.decoder], (msg: DecodedMessage) => {
-          logger.info(`Relay callback fired: payload=${msg.payload?.length ?? 0} bytes`);
-          if (msg.payload && msg.payload.length > 0 && this.handler) {
-            this.handler(msg.payload);
-          } else {
-            logger.warn(`Relay message has empty/null payload — skipping`);
-          }
-        });
-        logger.info(`Relay subscribed to ${this.config.contentTopic}`);
-      } catch (err) {
-        logger.warn(`Relay subscribe error: ${(err as Error).message}`);
-      }
-    }
+    // Primary RECEIVE path: Filter. A service node subscribes to the mesh on
+    // our behalf and pushes matching messages down our outbound stream.
+    await this.filterSubscribe();
 
-    // Secondary: Filter subscribe — this is the primary RECEIVE path.
-    // Filter V2: a full-node peer on the testnet subscribes to the gossipsub
-    // mesh and pushes matching messages directly to us. This worked reliably
-    // before the refactor (when we used createLightNode) and is the reason
-    // messages were received. With our hybrid node, Filter is now enabled again.
-    let filterPeers = 0;
-    if (this.node?.filter) {
-      try {
-        const result = await this.node.filter.subscribe(this.decoder, (msg: DecodedMessage) => {
-          logger.info(`Filter callback fired: payload=${msg.payload?.length ?? 0} bytes`);
-          if (msg.payload && this.handler) {
-            this.handler(msg.payload);
-          }
-        });
-
-        if (result.error) {
-          logger.warn(`Waku filter subscribe failed: ${result.error}`);
-        }
-        const failures = result.results?.failures?.length ?? 0;
-        const successes = result.results?.successes?.length ?? 0;
-        filterPeers = successes;
-        if (successes === 0 && failures > 0) {
-          logger.warn('Waku filter subscribe: no peer accepted the subscription');
-        } else if (successes > 0) {
-          logger.info(`Filter subscribed to ${this.config.contentTopic} (${successes} peer(s))`);
-        } else {
-          logger.info(`Filter subscribe returned: successes=0, failures=0, error=${result.error ?? 'none'} — waiting for peers`);
-        }
-      } catch (err) {
-        logger.warn(`Filter subscribe error: ${(err as Error).message}`);
-      }
-    }
-
-    // Tertiary: Store polling as a last-resort fallback for message retrieval.
-    if (!this.node?.relay && filterPeers === 0) {
-      this.startStorePolling();
-      logger.info('No Relay or Filter — relying on Store polling for message retrieval');
-    } else if (this.node?.store) {
-      // Even with Relay, use Store polling to catch messages missed during reconnects.
+    // Safety net: poll Store for anything Filter dropped (subscriptions can be
+    // evicted by the service node, especially across reconnects). Cheap and
+    // de-duplicated upstream by message id in the bridge.
+    if (this.node?.store) {
       this.startStorePolling();
     }
+
+    // Filter subscriptions are not forever — periodically re-subscribe so a
+    // silently-dropped subscription self-heals without a restart.
+    this.startFilterHealth();
+  }
+
+  /** (Re)establish the Filter subscription. Safe to call repeatedly. */
+  private async filterSubscribe(): Promise<number> {
+    if (!this.node?.filter || !this.decoder || !this.handler) return 0;
+    try {
+      const result = await this.node.filter.subscribe(this.decoder, (msg: DecodedMessage) => {
+        if (msg.payload && msg.payload.length > 0 && this.handler) {
+          this.handler(msg.payload);
+        }
+      });
+
+      if (result?.error) {
+        logger.warn(`Waku filter subscribe failed: ${result.error}`);
+        return 0;
+      }
+      const successes = result?.results?.successes?.length ?? 0;
+      const failures = result?.results?.failures?.length ?? 0;
+      if (successes > 0) {
+        logger.info(`Filter subscribed to ${this.config.contentTopic} (${successes} peer(s))`);
+      } else if (failures > 0) {
+        logger.warn('Filter subscribe: no peer accepted the subscription (Store fallback active)');
+      }
+      return successes;
+    } catch (err) {
+      logger.warn(`Filter subscribe error: ${(err as Error).message}`);
+      return 0;
+    }
+  }
+
+  private startFilterHealth(): void {
+    if (this.filterHealthTimer) return;
+    // Re-subscribe every 20s. js-waku de-dupes identical subscriptions, so this
+    // is a no-op when healthy and a recovery when the subscription was dropped.
+    this.filterHealthTimer = setInterval(() => void this.filterSubscribe(), 20000);
+    this.filterHealthTimer.unref?.();
   }
 
   /**
    * Poll the Waku Store protocol every 5 seconds for messages on our content
-   * topic that we may have missed (e.g. when Filter subscribe has 0 peers).
+   * topic since the last query — a backstop for whatever Filter misses.
    */
   private startStorePolling(): void {
     if (this.storePollTimer) return;
     this.lastStoreQueryTime = new Date();
     this.storePollTimer = setInterval(() => void this.pollStore(), 5000);
     this.storePollTimer.unref?.();
-    logger.info('Started Store polling fallback for message retrieval');
+    logger.info('Started Store polling backstop for message retrieval');
   }
 
   private async pollStore(): Promise<void> {
     if (this.storePolling || !this.node?.store || !this.decoder || !this.handler) return;
     this.storePolling = true;
+    const queryStart = new Date();
     try {
-      const queryOpts: any = { pageSize: 50 };
+      const queryOpts: any = { paginationLimit: 50, paginationForward: true };
       if (this.lastStoreQueryTime) {
-        queryOpts.startTime = this.lastStoreQueryTime;
+        queryOpts.timeStart = this.lastStoreQueryTime;
       }
-      let receivedAny = false;
       await this.node.store.queryWithOrderedCallback(
         [this.decoder],
         (msg: DecodedMessage) => {
-          if (msg.payload && this.handler) {
-            receivedAny = true;
+          if (msg.payload && msg.payload.length > 0 && this.handler) {
             this.handler(msg.payload);
           }
         },
         queryOpts
       );
-      if (receivedAny) {
-        logger.info('Store polling retrieved messages');
-      }
+      // Advance the window only after a successful query so a failed poll
+      // doesn't create a gap.
+      this.lastStoreQueryTime = queryStart;
     } catch (error) {
       logger.warn(`Store polling error: ${(error as Error).message}`);
     } finally {
-      this.lastStoreQueryTime = new Date();
       this.storePolling = false;
     }
   }
 
   /**
-   * Publish bytes to the configured content topic.
-   * Primary: Relay (gossipsub) broadcast — messages go to all mesh peers.
-   * Fallback: LightPush if Relay is not available or fails.
+   * Publish bytes via LightPush. The public fleet has peers that reject pushes
+   * (e.g. RLN rate limiting), so a partial success (>=1 peer) counts as sent;
+   * we only retry/back off when every peer rejects.
    */
   async publish(payload: Uint8Array, retries = 5): Promise<void> {
-    if (!this.encoder) {
+    if (!this.node?.lightPush || !this.encoder) {
       throw new Error('Waku transport not started');
-    }
-
-    // Primary: Relay broadcast — most reliable on the testnet.
-    if (this.node?.relay) {
-      try {
-        await this.node.relay.send(this.encoder, { payload });
-        return;
-      } catch (relayError) {
-        logger.warn(`Relay send failed: ${(relayError as Error).message}, falling back to LightPush`);
-      }
-    }
-
-    // Fallback: LightPush with retries.
-    if (!this.node?.lightPush) {
-      logger.warn('No Relay or LightPush available — message could not be sent');
-      return;
     }
 
     let lastFailures = 'unknown error';
@@ -335,14 +245,15 @@ export class WakuTransport implements Transport {
       }
     }
 
-    // Don't crash — failures are a Waku network condition, not fatal.
-    logger.warn(`LightPush failed after ${retries} attempts (agent can still receive): ${lastFailures}`);
+    // Don't crash — push failures are a transient network condition, not fatal.
+    // The bridge resends, and the peer can still reach us via Filter/Store.
+    logger.warn(`LightPush failed after ${retries} attempts (will be retried): ${lastFailures}`);
   }
 
   async getPeerCount(): Promise<number> {
     if (!this.node) return 0;
     try {
-      const peers = await this.node.getConnectedPeers();
+      const peers = await this.node.libp2p.getPeers();
       return peers.length;
     } catch {
       return 0;
@@ -357,6 +268,10 @@ export class WakuTransport implements Transport {
     if (this.storePollTimer) {
       clearInterval(this.storePollTimer);
       this.storePollTimer = null;
+    }
+    if (this.filterHealthTimer) {
+      clearInterval(this.filterHealthTimer);
+      this.filterHealthTimer = null;
     }
     if (this.node) {
       try {
