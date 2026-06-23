@@ -74,6 +74,14 @@ export class WakuTransport implements Transport {
   }
 
   async start(peerWaitTimeoutMs = 30000): Promise<void> {
+    // The SDK logs the REAL LightPush failure reason (e.g. "v3 status code 505:
+    // No relay peers available") only through its `debug` logger, and our
+    // publish() otherwise sees a bare "Remote peer rejected". Set
+    // HIVESYNC_WAKU_DEBUG=1 to surface those lines — invaluable for diagnosing
+    // why sending fails on a given host. Must be enabled before the SDK loads.
+    if (process.env.HIVESYNC_WAKU_DEBUG && !process.env.DEBUG) {
+      process.env.DEBUG = 'waku:*light-push*,waku:*sdk:light-push*,waku:*peer-manager*';
+    }
     const sdk = await loadSdk();
     const { createLightNode, waitForRemotePeer, Protocols } = sdk;
 
@@ -88,11 +96,21 @@ export class WakuTransport implements Transport {
     // A light node connects OUT to the public fleet; it does not need to listen
     // for inbound dials. defaultBootstrap discovers The Waku Network service
     // nodes via DNS discovery + the static bootstrap list.
+    //
+    // numPeersToUse: the SDK defaults to 1 — every LightPush goes to a SINGLE
+    // service node. If that node can't relay our shard (status 505 NO_PEERS) or
+    // its stream is reset (common from NAT'd / proxied VPSs), the whole publish
+    // fails. Fanning out to several peers in parallel means the message is sent
+    // as long as ANY one of them accepts it — the single most effective fix for
+    // "LightPush delivered to 0 peers" on the public fleet.
+    // numPeersToUse is honored at runtime (WakuNode -> PeerManager) but is not
+    // in the SDK's CreateNodeOptions d.ts, hence the cast.
     this.node = await createLightNode({
       defaultBootstrap: useDefaultBootstrap,
       bootstrapPeers: useDefaultBootstrap ? undefined : this.config.bootstrapNodes,
       networkConfig,
-    });
+      numPeersToUse: this.config.lightPushPeers ?? 3,
+    } as any);
 
     await this.node.start();
 

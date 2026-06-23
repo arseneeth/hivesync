@@ -152,6 +152,13 @@ export interface WakuConfig {
   contentTopic: string;
   keepAlive: boolean;
   maxPeers: number;
+  /**
+   * How many LightPush service nodes to send each message to in parallel.
+   * The SDK default is 1, which fails entirely if that one peer can't relay
+   * (status 505 NO_PEERS) or its stream is reset. Defaults to 3 here. Raise it
+   * on flaky networks; a single accepting peer is enough for delivery.
+   */
+  lightPushPeers?: number;
 }
 
 export interface ObsidianConfig {
