@@ -99,10 +99,15 @@ export class HiveSync {
       this.isConnected = true;
       logger.success(`HiveSync bridge connected as ${this.identity.agentId} (key ${this.identity.keyId})`);
 
-      // Announce presence now, and a couple of times shortly after to ride out
-      // subscription propagation, then on a steady interval.
-      await this.announce();
-      this.earlyAnnounceTimer = setTimeout(() => void this.announce(), 2000);
+      // Gate the FIRST announce on having a connected peer, so the initial
+      // send doesn't fire into the void and burn its retries before any
+      // LightPush/relay peer is available (a real startup race on slow
+      // networks). Done in the background so startup never blocks; the steady
+      // interval below announces regardless.
+      void this.waitForPeers(15000)
+        .then(() => this.announce())
+        .catch((e) => logger.debug('initial announce failed:', e));
+      this.earlyAnnounceTimer = setTimeout(() => void this.announce(), 8000);
       this.earlyAnnounceTimer.unref?.();
       const intervalSec = this.config.syncInterval > 0 ? this.config.syncInterval : 30;
       this.announceTimer = setInterval(() => void this.announce(), intervalSec * 1000);
@@ -113,6 +118,23 @@ export class HiveSync {
       logger.error('Failed to initialize HiveSync bridge:', error);
       this.isConnected = false;
       return false;
+    }
+  }
+
+  /** Poll until at least one peer is connected, or the timeout elapses. */
+  private async waitForPeers(timeoutMs: number): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline && this.isConnected) {
+      try {
+        if ((await this.transport.getPeerCount()) > 0) return;
+      } catch {
+        /* transport may not expose peers yet */
+      }
+      // unref'd so a pending wait never keeps the process (or a test) alive.
+      await new Promise((r) => {
+        const t = setTimeout(r, 500);
+        t.unref?.();
+      });
     }
   }
 

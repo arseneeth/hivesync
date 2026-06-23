@@ -50,9 +50,15 @@ program
       }
 
       const bridge = new BridgeManager(config);
-      const interactive = !options.daemon && !options.plain && process.stdout.isTTY;
+      // A TTY on BOTH streams is required for any interactive UI. Without it
+      // (systemd, nohup, docker, pm2, &) the REPL's tcsetattr() throws
+      // "Inappropriate ioctl for device" and kills the daemon — so a non-TTY
+      // session must run headless, never interactive.
+      const hasTty = !!process.stdin.isTTY && !!process.stdout.isTTY;
+      const useTui = !options.daemon && !options.plain && hasTty;
+      const useRepl = !options.daemon && options.plain && hasTty;
 
-      if (interactive) {
+      if (useTui) {
         // Telegram-style messaging UI, preceded by the connect-to-hivemind
         // splash (which performs the real bridge.start() under the animation).
         await runConnectSequence(bridge, config);
@@ -68,17 +74,30 @@ program
       }
       logger.success(`Bridge started successfully! Agent ID: ${config.agentId}`);
 
-      if (options.daemon) {
-        logger.info('Running in daemon mode...');
-        // Keep process alive
-        process.on('SIGINT', async () => {
-          logger.info('Shutting down...');
-          await bridge.stop();
-          process.exit(0);
-        });
-      } else {
-        // Scriptable line-based REPL (also used by non-TTY / piped sessions).
+      if (useRepl) {
+        // Scriptable line-based REPL — only safe with a real TTY.
         await setupInteractiveMode(bridge);
+      } else {
+        // Headless daemon: no stdin reads (would crash a non-PTY process).
+        // Keep the event loop alive and shut down cleanly on signals.
+        logger.info('Running headless (daemon mode). Stop with Ctrl-C or SIGTERM.');
+        let shuttingDown = false;
+        const shutdown = async (sig: string): Promise<void> => {
+          if (shuttingDown) return;
+          shuttingDown = true;
+          logger.info(`Received ${sig}, shutting down...`);
+          await bridge.stop().catch(() => undefined);
+          process.exit(0);
+        };
+        process.on('SIGINT', () => void shutdown('SIGINT'));
+        process.on('SIGTERM', () => void shutdown('SIGTERM'));
+        // The bridge's own timers are unref'd; this keeps the process alive.
+        const keepAlive = setInterval(() => undefined, 1 << 30);
+        // Surface unexpected errors instead of dying silently in the background.
+        process.on('uncaughtException', (err) => logger.error('uncaughtException:', err));
+        process.on('unhandledRejection', (err) => logger.error('unhandledRejection:', err));
+        await new Promise<void>(() => undefined); // run forever
+        clearInterval(keepAlive);
       }
     } catch (error) {
       logger.error('Failed to start bridge:', error);
