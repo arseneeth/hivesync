@@ -140,9 +140,22 @@ export interface SyncState {
 }
 
 export interface WakuConfig {
+  /**
+   * Transport mode.
+   * - 'light' (default): connect out to the public Waku fleet (LightPush +
+   *   Filter + Store). Zero infra, but publishing depends on a public service
+   *   node accepting our push — unreliable on some hosts/networks over time.
+   * - 'relay': run a GossipSub relay node and connect all agents to a common
+   *   reachable hub (one VPS listening on an open port). One connected mesh,
+   *   no LightPush, no public-fleet dependency, no RLN. Reliable for 2-3 agents.
+   */
+  mode?: 'light' | 'relay';
   listenAddresses: string[];
   bootstrapNodes: string[];
-  /** Direct peers to connect to on startup (multiaddress strings). */
+  /**
+   * Multiaddresses to dial on startup. In 'relay' mode this is how spokes reach
+   * the hub, e.g. ['/ip4/1.2.3.4/tcp/443/ws/p2p/16Uiu2HA...'].
+   */
   directPeers: string[];
   /** Waku cluster id (The Waku Network is cluster 1). */
   clusterId: number;

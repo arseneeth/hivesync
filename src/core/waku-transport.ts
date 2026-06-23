@@ -23,6 +23,33 @@ function loadSdk(): Promise<WakuSdk> {
   return sdkPromise;
 }
 
+// Relay mode needs @waku/relay (createRelayNode), @waku/utils (createRoutingInfo)
+// and @multiformats/multiaddr (to dial the hub). All ESM-only; loaded lazily.
+let relayPromise: Promise<any> | null = null;
+function loadRelay(): Promise<any> {
+  if (!relayPromise) {
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval
+    relayPromise = new Function('return import("@waku/relay")')() as Promise<any>;
+  }
+  return relayPromise;
+}
+let utilsPromise: Promise<any> | null = null;
+function loadUtils(): Promise<any> {
+  if (!utilsPromise) {
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval
+    utilsPromise = new Function('return import("@waku/utils")')() as Promise<any>;
+  }
+  return utilsPromise;
+}
+let maPromise: Promise<any> | null = null;
+function loadMultiaddr(): Promise<any> {
+  if (!maPromise) {
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval
+    maPromise = new Function('return import("@multiformats/multiaddr")')() as Promise<any>;
+  }
+  return maPromise;
+}
+
 export type RawMessageHandler = (payload: Uint8Array) => void;
 
 /**
@@ -58,15 +85,30 @@ export class WakuTransport implements Transport {
   private started = false;
   private storePollTimer: NodeJS.Timeout | null = null;
   private filterHealthTimer: NodeJS.Timeout | null = null;
+  private redialTimer: NodeJS.Timeout | null = null;
   private lastStoreQueryTime: Date | null = null;
   private storePolling = false;
+  private relayUnsub: (() => void) | null = null;
 
   constructor(config: WakuConfig) {
     this.config = config;
   }
 
+  private get isRelay(): boolean {
+    return this.config.mode === 'relay';
+  }
+
   isStarted(): boolean {
     return this.started;
+  }
+
+  /** Multiaddrs other agents can dial to reach this node (useful for a hub). */
+  getDialableMultiaddrs(): string[] {
+    try {
+      return (this.node?.libp2p.getMultiaddrs() ?? []).map((m: any) => m.toString());
+    } catch {
+      return [];
+    }
   }
 
   pubsubTopic(): string | undefined {
@@ -74,6 +116,87 @@ export class WakuTransport implements Transport {
   }
 
   async start(peerWaitTimeoutMs = 30000): Promise<void> {
+    if (this.isRelay) return this.startRelay(peerWaitTimeoutMs);
+    return this.startLight(peerWaitTimeoutMs);
+  }
+
+  /**
+   * Relay mode: run a GossipSub relay node. The hub sets listenAddresses and
+   * (typically) no directPeers; spokes set directPeers=[hub multiaddr]. Once
+   * connected and subscribed to the same content topic, all nodes form one
+   * mesh and the hub relays between spokes — no LightPush, no public fleet.
+   */
+  private async startRelay(peerWaitTimeoutMs: number): Promise<void> {
+    const [relayMod, utils] = await Promise.all([loadRelay(), loadUtils()]);
+    const { createRelayNode } = relayMod;
+    const { createRoutingInfo } = utils;
+
+    const networkConfig = {
+      clusterId: this.config.clusterId,
+      numShardsInCluster: this.config.numShardsInCluster,
+    };
+    const routingInfo = createRoutingInfo(networkConfig, {
+      contentTopic: this.config.contentTopic,
+    });
+
+    // Pure private mesh by default (no public fleet): connectivity comes from
+    // listenAddresses (hub) + directPeers (spokes dial the hub). Set
+    // bootstrapNodes to also peer with extra relay nodes if desired.
+    const useBootstrap = !!this.config.bootstrapNodes?.length;
+    this.node = await createRelayNode({
+      defaultBootstrap: false,
+      bootstrapPeers: useBootstrap ? this.config.bootstrapNodes : undefined,
+      networkConfig,
+      routingInfos: [routingInfo],
+      libp2p: {
+        addresses: { listen: this.config.listenAddresses ?? [] },
+        // Allow plain (non-TLS) ws multiaddrs so a Node hub can listen on /ws
+        // and Node spokes can dial it. Without this the SDK restricts to wss.
+        filterMultiaddrs: false,
+      },
+    } as any);
+
+    await this.node.start();
+
+    this.encoder = this.node.createEncoder({ contentTopic: this.config.contentTopic });
+    this.decoder = this.node.createDecoder({ contentTopic: this.config.contentTopic });
+
+    // Dial the hub / configured peers, then keep redialing so a dropped link to
+    // the hub self-heals (the mesh depends on this connection staying up).
+    await this.dialDirectPeers();
+    this.redialTimer = setInterval(() => void this.dialDirectPeers(), 20000);
+    this.redialTimer.unref?.();
+
+    // Best-effort wait for at least one relay peer (the hub).
+    const deadline = Date.now() + peerWaitTimeoutMs;
+    while (Date.now() < deadline && (await this.getPeerCount()) === 0) {
+      await delay(1000);
+    }
+
+    this.started = true;
+    logger.info(`Waku relay node started (peerId ${this.node.peerId.toString()})`);
+    const addrs = this.getDialableMultiaddrs();
+    if (addrs.length) {
+      logger.info(`Relay listening — dialable as:\n  ${addrs.join('\n  ')}`);
+    }
+    logger.info(`Relay peers connected: ${await this.getPeerCount()}`);
+  }
+
+  /** Dial every configured directPeer; idempotent and safe to call repeatedly. */
+  private async dialDirectPeers(): Promise<void> {
+    const peers = this.config.directPeers ?? [];
+    if (!peers.length || !this.node) return;
+    const ma = await loadMultiaddr();
+    for (const addr of peers) {
+      try {
+        await this.node.libp2p.dial(ma.multiaddr(addr));
+      } catch (err) {
+        logger.warn(`Relay dial failed for ${addr}: ${(err as Error).message}`);
+      }
+    }
+  }
+
+  private async startLight(peerWaitTimeoutMs: number): Promise<void> {
     // The SDK logs the REAL LightPush failure reason (e.g. "v3 status code 505:
     // No relay peers available") only through its `debug` logger, and our
     // publish() otherwise sees a bare "Remote peer rejected". Set
@@ -137,10 +260,21 @@ export class WakuTransport implements Transport {
   }
 
   async subscribe(handler: RawMessageHandler): Promise<void> {
+    this.handler = handler;
+
+    if (this.isRelay) {
+      if (!this.node?.relay || !this.decoder) throw new Error('Waku transport not started');
+      // Receive straight off the GossipSub mesh — no Filter/Store needed.
+      this.relayUnsub = this.node.relay.subscribeWithUnsubscribe([this.decoder], (msg: DecodedMessage) => {
+        if (msg.payload && msg.payload.length > 0 && this.handler) this.handler(msg.payload);
+      });
+      logger.info(`Relay subscribed to ${this.config.contentTopic}`);
+      return;
+    }
+
     if (!this.node?.filter || !this.decoder) {
       throw new Error('Waku transport not started');
     }
-    this.handler = handler;
 
     // Primary RECEIVE path: Filter. A service node subscribes to the mesh on
     // our behalf and pushes matching messages down our outbound stream.
@@ -240,6 +374,21 @@ export class WakuTransport implements Transport {
    * we only retry/back off when every peer rejects.
    */
   async publish(payload: Uint8Array, retries = 5): Promise<void> {
+    if (this.isRelay) {
+      if (!this.node?.relay || !this.encoder) throw new Error('Waku transport not started');
+      // Publish into the mesh; the hub forwards to the other spokes. We don't
+      // hard-fail on a transient empty result — the bridge resends.
+      try {
+        const res: any = await this.node.relay.send(this.encoder, { payload });
+        if ((res?.successes?.length ?? 0) === 0 && (res?.failures?.length ?? 0) > 0) {
+          logger.warn(`Relay send reached 0 mesh peers: ${JSON.stringify(res.failures)}`);
+        }
+      } catch (err) {
+        logger.warn(`Relay send error: ${(err as Error).message}`);
+      }
+      return;
+    }
+
     if (!this.node?.lightPush || !this.encoder) {
       throw new Error('Waku transport not started');
     }
@@ -290,6 +439,18 @@ export class WakuTransport implements Transport {
     if (this.filterHealthTimer) {
       clearInterval(this.filterHealthTimer);
       this.filterHealthTimer = null;
+    }
+    if (this.redialTimer) {
+      clearInterval(this.redialTimer);
+      this.redialTimer = null;
+    }
+    if (this.relayUnsub) {
+      try {
+        this.relayUnsub();
+      } catch {
+        /* ignore */
+      }
+      this.relayUnsub = null;
     }
     if (this.node) {
       try {
