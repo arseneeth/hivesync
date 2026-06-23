@@ -41,6 +41,15 @@ function loadUtilsMod(): Promise<WakuUtilsMod> {
   return utilsModPromise;
 }
 
+/** Dynamic import for multiaddr (ESM-only, loaded at runtime). */
+let maMod: any = null;
+async function loadMultiaddr(): Promise<any> {
+  if (!maMod) {
+    maMod = await new Function('return import("@multiformats/multiaddr")')();
+  }
+  return maMod;
+}
+
 export type RawMessageHandler = (payload: Uint8Array) => void;
 
 /**
@@ -152,10 +161,11 @@ export class WakuTransport implements Transport {
 
     // Connect to any configured direct peers.
     if (this.config.directPeers && this.config.directPeers.length > 0) {
+      const maMod = await loadMultiaddr();
       for (const peerAddr of this.config.directPeers) {
         try {
           logger.info(`Dialing direct peer: ${peerAddr}`);
-          await this.node.libp2p.dial(peerAddr);
+          await this.node.libp2p.dial(maMod.multiaddr(peerAddr));
           logger.info(`Connected to direct peer: ${peerAddr}`);
         } catch (err) {
           logger.warn(`Failed to dial direct peer ${peerAddr}: ${(err as Error).message}`);
