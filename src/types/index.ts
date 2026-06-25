@@ -185,6 +185,13 @@ export interface WakuConfig {
    * on flaky networks; a single accepting peer is enough for delivery.
    */
   lightPushPeers?: number;
+  /**
+   * Minimum gap (ms) between outbound LightPush sends. Sends are serialized and
+   * spaced by this much so a burst (e.g. the outbox draining many queued
+   * messages at once) doesn't trip the public fleet's per-source rate limiting
+   * (which surfaces as "Remote peer rejected"). Defaults to 300ms.
+   */
+  sendGapMs?: number;
 }
 
 export interface ObsidianConfig {

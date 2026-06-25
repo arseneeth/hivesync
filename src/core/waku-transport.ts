@@ -132,6 +132,9 @@ export class WakuTransport implements Transport {
   private lastStoreQueryTime: Date | null = null;
   private storePolling = false;
   private relayUnsub: (() => void) | null = null;
+  // Serializes + paces outbound LightPush so bursts don't trip fleet rate limits.
+  private sendChain: Promise<void> = Promise.resolve();
+  private lastSendAt = 0;
 
   constructor(config: WakuConfig) {
     this.config = config;
@@ -468,6 +471,29 @@ export class WakuTransport implements Transport {
       throw new Error('Waku transport not started');
     }
 
+    // PACING: serialize LightPush sends and space them out. A burst (e.g. the
+    // outbox draining 37 queued Obsidian updates, each ×retries) hammers the
+    // public fleet's service nodes and trips their per-source rate limiting —
+    // which comes back as "Remote peer rejected" and looks like a hard failure.
+    // The proven-working light-node code is identical to this; what changed is
+    // the traffic shape, so we smooth it. Gap is configurable (sendGapMs).
+    const gap = this.config.sendGapMs ?? 300;
+    const run = this.sendChain.then(async () => {
+      const since = Date.now() - this.lastSendAt;
+      if (since < gap) await delay(gap - since);
+      try {
+        await this.lightPushWithRetries(payload, retries);
+      } finally {
+        this.lastSendAt = Date.now();
+      }
+    });
+    // Keep the chain alive even if this send threw.
+    this.sendChain = run.catch(() => undefined);
+    return run;
+  }
+
+  /** LightPush with retry/back-off. A partial success (>=1 peer) counts as sent. */
+  private async lightPushWithRetries(payload: Uint8Array, retries: number): Promise<void> {
     let lastFailures = 'unknown error';
     for (let attempt = 1; attempt <= retries; attempt++) {
       let result: any;
