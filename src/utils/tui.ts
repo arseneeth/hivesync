@@ -39,6 +39,7 @@ export async function startTui(
 
   screen.program.alternateBuffer();
   screen.program.clear();
+  screen.enableMouse();
 
   // Debounced render: network events (agentDiscovered, text bursts) can fire
   // many times in one tick. Repainting synchronously on each one paints partial

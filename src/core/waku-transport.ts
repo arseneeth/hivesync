@@ -486,7 +486,16 @@ export class WakuTransport implements Transport {
     }
 
     if (!this.node?.lightPush || !this.encoder) {
-      throw new Error('Waku transport not started');
+      // Fresh connections sometimes take a moment to discover LightPush peers.
+      // Wait with backoff instead of immediately failing.
+      let waited = 0;
+      while (!this.node?.lightPush && waited < 15000) {
+        await delay(1000);
+        waited += 1000;
+      }
+      if (!this.node?.lightPush || !this.encoder) {
+        throw new Error('Waku transport not started');
+      }
     }
 
     // PACING: serialize LightPush sends and space them out. A burst (e.g. the
